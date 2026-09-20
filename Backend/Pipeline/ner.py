@@ -899,39 +899,17 @@ def fallback_keyword_extraction(fact: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 5 — Pipeline Integration Engine
-# ─────────────────────────────────────────────────────────────────────────────
-def extract_query(fact: str) -> str:
-    """
-    Executes the comprehensive Named Entity Query Extraction pipeline.
-    
-    Execution Flow:
-    [Atomic Fact input] -> extract_entities() -> filter_entities() -> build_query()
-                                                                          |
-                                                      (If Query is Empty) v
-                                                           fallback_keyword_extraction()
-    """
-    print(f"\n[NER] Processing atomic unit: '{fact}'")
-
-    entities = extract_entities(fact)
-    filtered = filter_entities(entities)
-    query    = build_query(filtered, fact)
-
-    # Trigger fallback logic if entity structures yield an empty sequence
-    if query is None:
-        print("[NER] Structural resolution failed. Triggering semantic keyword fallback extraction.")
-        query = fallback_keyword_extraction(fact)
-
-    print(f"[NER] Final synthesized query: '{query}'")
-    return query
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 6 — Multi-Query Extraction (used by retriever.fetch)
+# STEP 5 — Multi-Query Extraction (used by retriever.fetch)
 # ─────────────────────────────────────────────────────────────────────────────
 def extract_queries(fact: str, max_queries: int = 3) -> list[str]:
     """
-    Multi-query variant of extract_query() for robust retrieval.
+    The Named Entity Query Extraction pipeline: the queries retrieval runs.
+
+    Execution Flow:
+    [Atomic Fact] -> extract_entities() -> filter_entities() -> build_query()
+                                                                     |
+                                                 (If Query is Empty) v
+                                                      fallback_keyword_extraction()
 
     Single-query retrieval has a brittle failure mode: the query anchors on
     the top-2 priority entities, so ONE hallucinated or mis-typed entity
@@ -942,7 +920,7 @@ def extract_queries(fact: str, max_queries: int = 3) -> list[str]:
     means at least one query still lands on the right article.
 
     Returns (deduplicated, priority order):
-        1. The combined top-2 entity query (same as extract_query)
+        1. The combined top-2 entity query
         2. One standalone query per top-2 entity — date entities excluded,
            since a bare "1889" retrieves the year article (pure noise)
         3. Keyword fallback if nothing else was produced

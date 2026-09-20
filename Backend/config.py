@@ -13,38 +13,25 @@
 # affect a module the editor didn't intend to touch. Single-module constants
 # belong with their module.
 #
-# Import pattern for all pipeline modules:
-#     from config import OLLAMA_BASE_URL, FAST_MODEL, REASONING_MODEL, MAX_INPUT_WORDS
+# MODEL IDENTIFIERS ARE NOT HERE, DELIBERATELY. This file used to declare
+# FAST_MODEL and REASONING_MODEL, and nothing ever read them: every module
+# that calls Ollama names its model inline (claim_extractor.FAST_MODEL,
+# program.ANSWER_MODEL, verifier.REASONING_MODEL), and ollama_client keeps
+# the startup-check roster in its own MODEL_ROLES. The unread copies had
+# drifted — this file claimed the extractor was "autocitation-extractor"
+# while every run used phi3:mini — so they were worse than redundant: a
+# reader consulting config.py would have learned the wrong model. If these
+# ever come back, they have to be the values actually passed to Ollama, not
+# a parallel declaration of intent.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 # ── Ollama server ─────────────────────────────────────────────────────────────
 # OLLAMA_BASE_URL: Root URL of the local Ollama REST server.
-# All pipeline modules that talk to Ollama (ollama_client.py) derive their
-# endpoint URLs from this base rather than hardcoding the host/port
-# individually. Changing the port or moving Ollama to a remote host during
-# development requires editing exactly one line here.
+# Read by ollama_client.pull_model() to build the /api/pull endpoint.
+# Changing the port or moving Ollama to a remote host during development
+# requires editing exactly one line here.
 OLLAMA_BASE_URL: str = "http://localhost:11434"
-
-# Derived endpoint URLs built from the base so callers never construct paths.
-OLLAMA_GENERATE_URL: str = f"{OLLAMA_BASE_URL}/api/generate"
-OLLAMA_TAGS_URL: str     = f"{OLLAMA_BASE_URL}/api/tags"
-
-
-# ── Model identifiers ─────────────────────────────────────────────────────────
-# FAST_MODEL: Lightweight extraction model used by claim_extractor.py.
-# Selected for high token/s throughput — the extraction loop calls the
-# model up to MAX_ITERATIONS times per input paragraph, so inference
-# speed directly determines end-to-end latency more than accuracy does
-# at this stage.
-FAST_MODEL: str = "autocitation-extractor"
-
-# REASONING_MODEL: Larger reasoning model used by verifier.py.
-# Selected for deeper chain-of-thought capability needed to classify a
-# claim as SUPPORTS / REFUTES / NOT ENOUGH INFO against evidence chunks.
-# Accuracy matters more than throughput here — the verifier is called
-# once per fact, not in a tight loop.
-REASONING_MODEL: str = "qwen3:8b"
 
 
 # ── Input validation ──────────────────────────────────────────────────────────
@@ -56,4 +43,3 @@ REASONING_MODEL: str = "qwen3:8b"
 # window. Inputs beyond this limit would require chunking the input itself,
 # which is out of scope for the PoC.
 MAX_INPUT_WORDS: int = 500
-

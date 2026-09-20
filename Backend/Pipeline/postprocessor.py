@@ -48,7 +48,7 @@ def resolve_wikipedia_url(query: str) -> str:
     Resolves a free-text NER search query to a canonical Wikipedia article URL.
 
     Why not construct the URL directly from the NER query?
-    The NER query produced by ner.extract_query() is a multi-entity phrase
+    The NER query produced by ner.extract_queries() is a multi-entity phrase
     (e.g., "Mehmed II Constantinople") optimized for Wikipedia's search
     engine, not for direct URL construction. Directly URL-encoding that
     phrase would produce a Special:Search URL rather than a real article
@@ -75,7 +75,7 @@ def resolve_wikipedia_url(query: str) -> str:
     the frontend.
 
     Args:
-        query : free-text search string from ner.extract_query()
+        query : free-text search string from ner.extract_queries()
                 (e.g., "Mehmed II Constantinople", "Python Guido van Rossum")
 
     Returns:
@@ -226,7 +226,7 @@ def assemble_result(
         label     : raw label string from verifier.verify() [pre-normalization]
         rationale : one-sentence explanation from verifier.verify()
         evidence  : the evidence chunk the verifier selected
-        ner_query : the search query produced by ner.extract_query() for
+        ner_query : the search query produced by ner.extract_queries() for
                     this claim — used to resolve the Wikipedia source URL
 
     Returns:
@@ -428,7 +428,7 @@ def process(pipeline_outputs: list[dict]) -> dict:
         "label"     : str,   ← from verifier.verify() return[0]
         "rationale" : str,   ← from verifier.verify() return[1]
         "evidence"  : str,   ← from verifier.verify() return[2]
-        "ner_query" : str,   ← from ner.extract_query(), stored by main.py
+        "ner_query" : str,   ← from ner.extract_queries(), stored by main.py
     }
 
     Integration note for main.py:

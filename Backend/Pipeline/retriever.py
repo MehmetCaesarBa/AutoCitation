@@ -120,7 +120,7 @@ def fetch_articles(query: str) -> list[tuple[str, str]]:
     saw — and in practice always fell back to Special:Search.
 
     Args:
-        query : clean search string produced by ner.extract_query()
+        query : clean search string produced by ner.extract_queries()
 
     Returns:
         List of (article_content, article_url) tuples.
