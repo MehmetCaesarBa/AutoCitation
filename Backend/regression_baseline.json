@@ -1,0 +1,58 @@
+[
+  {
+    "id": "faithful_false_claim",
+    "passed": true,
+    "failures": [],
+    "elapsed_s": 368.2,
+    "claims": [
+      {
+        "claim": "Bosporus is located between Africa and Europe.",
+        "label": "REFUTES",
+        "nei_kind": null
+      }
+    ]
+  },
+  {
+    "id": "cross_sentence_coreference",
+    "passed": true,
+    "failures": [],
+    "elapsed_s": 1276.4,
+    "claims": [
+      {
+        "claim": "Bosporus is located between Africa and Europe.",
+        "label": "REFUTES",
+        "nei_kind": null
+      },
+      {
+        "claim": "Yavuz Sultan Selim Bridge is a bridge.",
+        "label": "SUPPORTS",
+        "nei_kind": null
+      },
+      {
+        "claim": "You can walk between Africa and Europe with Yavuz Sultan Selim Bridge.",
+        "label": "NOT ENOUGH INFO",
+        "nei_kind": "UNKNOWN"
+      }
+    ]
+  },
+  {
+    "id": "true_claim_supported",
+    "passed": true,
+    "failures": [],
+    "elapsed_s": 220.9,
+    "claims": [
+      {
+        "claim": "The Bosporus connects the Black Sea to the Sea of Marmara.",
+        "label": "SUPPORTS",
+        "nei_kind": null
+      }
+    ]
+  },
+  {
+    "id": "unverifiable_opinion",
+    "passed": true,
+    "failures": [],
+    "elapsed_s": 21.7,
+    "claims": []
+  }
+]

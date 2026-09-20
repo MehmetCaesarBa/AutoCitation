@@ -1,0 +1,8 @@
+# Test-only dependencies. Kept out of requirements.txt so deploying the API
+# does not pull in a test framework.
+#
+#   pip install -r requirements-dev.txt
+#   pytest
+
+pytest>=7.0          # 7.0 introduced the pythonpath ini option used in pytest.ini
+pytest-timeout       # @pytest.mark.timeout — catches infinite loops instead of hanging

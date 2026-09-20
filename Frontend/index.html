@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AutoCitation</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ── Design tokens ──────────────────────────────────────────────────────── */
+    :root {
+      --bg:            #0a0a0b;
+      --bg-surface:    #111114;
+      --bg-elevated:   #18181d;
+      --border:        #2a2a32;
+      --border-dim:    #1e1e25;
+      --text:          #e8e8f0;
+      --text-dim:      #7a7a8c;
+      --text-faint:    #3e3e50;
+      --accent:        #5b8fff;
+      --accent-dim:    #1e2d50;
+
+      --green:         #3ddc84;
+      --green-bg:      #0d2218;
+      --green-border:  #1a4030;
+      --red:           #ff5b5b;
+      --red-bg:        #220d0d;
+      --red-border:    #401a1a;
+      --yellow:        #f0c040;
+      --yellow-bg:     #22190a;
+      --yellow-border: #403010;
+
+      --mono: 'IBM Plex Mono', monospace;
+      --sans: 'IBM Plex Sans', sans-serif;
+
+      --radius: 4px;
+      --transition: 120ms ease;
+    }
+
+    /* ── Reset ──────────────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { font-size: 14px; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    /* ── Layout shell ───────────────────────────────────────────────────────── */
+    .shell {
+      width: 100%;
+      max-width: 860px;
+      padding: 48px 24px 80px;
+      display: flex;
+      flex-direction: column;
+      gap: 32px;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────────────── */
+    header {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      border-bottom: 1px solid var(--border-dim);
+      padding-bottom: 24px;
+    }
+
+    .wordmark {
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    h1 {
+      font-family: var(--mono);
+      font-size: 28px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      color: var(--text);
+      line-height: 1.15;
+    }
+
+    h1 span {
+      color: var(--accent);
+    }
+
+    .subtitle {
+      font-family: var(--sans);
+      font-size: 13px;
+      font-weight: 300;
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
+
+    /* ── Input panel ────────────────────────────────────────────────────────── */
+    .input-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .input-label {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+    }
+
+    .input-label-text {
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    #word-count {
+      font-size: 11px;
+      color: var(--text-faint);
+      transition: color var(--transition);
+    }
+
+    #word-count.warn  { color: var(--yellow); }
+    #word-count.limit { color: var(--red); }
+
+    textarea {
+      width: 100%;
+      height: 200px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.65;
+      padding: 14px 16px;
+      resize: vertical;
+      outline: none;
+      transition: border-color var(--transition);
+    }
+
+    textarea::placeholder { color: var(--text-faint); }
+
+    textarea:focus { border-color: var(--accent); }
+
+    .input-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+
+    /* ── Buttons ────────────────────────────────────────────────────────────── */
+    button {
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: background var(--transition), color var(--transition), border-color var(--transition), opacity var(--transition);
+      padding: 9px 18px;
+      border: 1px solid transparent;
+    }
+
+    .btn-ghost {
+      background: transparent;
+      border-color: var(--border);
+      color: var(--text-dim);
+    }
+
+    .btn-ghost:hover { border-color: var(--text-dim); color: var(--text); }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+
+    .btn-primary:hover { opacity: 0.88; }
+
+    .btn-primary:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+
+    /* ── Status bar ─────────────────────────────────────────────────────────── */
+    #status-bar {
+      display: none;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-dim);
+      border-radius: var(--radius);
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+
+    #status-bar.visible { display: flex; }
+
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      flex-shrink: 0;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Error block ────────────────────────────────────────────────────────── */
+    #error-block {
+      display: none;
+      padding: 12px 16px;
+      background: var(--red-bg);
+      border: 1px solid var(--red-border);
+      border-radius: var(--radius);
+      font-size: 12px;
+      color: var(--red);
+    }
+
+    #error-block.visible { display: block; }
+
+    /* ── Summary bar ────────────────────────────────────────────────────────── */
+    #summary-bar {
+      display: none;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    #summary-bar.visible { display: flex; }
+
+    .summary-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .summary-verdict {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      padding: 5px 12px;
+      border-radius: 2px;
+    }
+
+    .summary-verdict.green  { background: var(--green-bg);  color: var(--green);  border: 1px solid var(--green-border); }
+    .summary-verdict.red    { background: var(--red-bg);    color: var(--red);    border: 1px solid var(--red-border); }
+    .summary-verdict.yellow { background: var(--yellow-bg); color: var(--yellow); border: 1px solid var(--yellow-border); }
+
+    .summary-stats {
+      font-size: 11px;
+      color: var(--text-dim);
+      display: flex;
+      gap: 20px;
+    }
+
+    .stat-item { display: flex; gap: 6px; align-items: center; }
+
+    .stat-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .stat-dot.green  { background: var(--green); }
+    .stat-dot.red    { background: var(--red); }
+    .stat-dot.yellow { background: var(--yellow); }
+
+    /* ── Time bar (per-stage duration breakdown) ────────────────────────────── */
+    #time-bar-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    #time-bar {
+      display: flex;
+      height: 10px;
+      border-radius: 2px;
+      overflow: hidden;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-dim);
+    }
+
+    .time-seg {
+      height: 100%;
+      transition: width 0.4s ease;
+    }
+
+    #time-legend {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      font-size: 10px;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .legend-swatch {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
+    /* ── Results table ──────────────────────────────────────────────────────── */
+    #results-section {
+      display: none;
+      flex-direction: column;
+      gap: 0;
+    }
+
+    #results-section.visible { display: flex; }
+
+    .results-label {
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border-dim);
+      margin-bottom: 0;
+    }
+
+    /* Each fact row */
+    .fact-row {
+      border-bottom: 1px solid var(--border-dim);
+      padding: 18px 0;
+      display: grid;
+      grid-template-columns: 26px 1fr;
+      gap: 0 14px;
+      animation: fadeIn 0.25s ease both;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .fact-index {
+      font-size: 11px;
+      color: var(--text-faint);
+      padding-top: 2px;
+      text-align: right;
+      font-weight: 500;
+    }
+
+    .fact-body {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .fact-claim-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .fact-claim {
+      font-size: 13px;
+      line-height: 1.55;
+      color: var(--text);
+      flex: 1;
+      min-width: 200px;
+    }
+
+    .label-badge {
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      padding: 3px 9px;
+      border-radius: 2px;
+      white-space: nowrap;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .label-badge.green  { background: var(--green-bg);  color: var(--green);  border: 1px solid var(--green-border); }
+    .label-badge.red    { background: var(--red-bg);    color: var(--red);    border: 1px solid var(--red-border); }
+    .label-badge.yellow { background: var(--yellow-bg); color: var(--yellow); border: 1px solid var(--yellow-border); }
+
+    .fact-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .meta-line {
+      display: grid;
+      grid-template-columns: 80px 1fr;
+      gap: 8px;
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
+    .meta-key {
+      color: var(--text-faint);
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding-top: 1px;
+    }
+
+    .meta-value { color: var(--text-dim); }
+
+    .meta-value a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    .meta-value a:hover { text-decoration: underline; }
+
+    /* Collapsible evidence */
+    .evidence-toggle {
+      background: none;
+      border: none;
+      padding: 0;
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: color var(--transition);
+    }
+
+    .evidence-toggle:hover { color: var(--text-dim); }
+
+    .toggle-arrow {
+      display: inline-block;
+      transition: transform 0.15s ease;
+      font-style: normal;
+    }
+
+    .evidence-toggle.open .toggle-arrow { transform: rotate(90deg); }
+
+    .evidence-body {
+      display: none;
+      margin-top: 6px;
+      padding: 10px 12px;
+      background: var(--bg-elevated);
+      border-left: 2px solid var(--border);
+      border-radius: 0 var(--radius) var(--radius) 0;
+      font-size: 11px;
+      line-height: 1.65;
+      color: var(--text-dim);
+    }
+
+    .evidence-body.open { display: block; }
+
+    /* ── Footer ─────────────────────────────────────────────────────────────── */
+    footer {
+      margin-top: auto;
+      padding: 24px 0 0;
+      border-top: 1px solid var(--border-dim);
+      font-size: 10px;
+      color: var(--text-faint);
+      letter-spacing: 0.08em;
+      display: flex;
+      justify-content: space-between;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="shell">
+
+    <!-- Header -->
+    <header>
+      <span class="wordmark">AutoCitation · PoC v0.1</span>
+      <h1>Fact<span>.</span>Check</h1>
+      <p class="subtitle">Atomic claim extraction → Wikipedia retrieval → local LLM verification</p>
+    </header>
+
+    <!-- Input panel -->
+    <section class="input-panel">
+      <div class="input-label">
+        <span class="input-label-text">Input Text</span>
+        <span id="word-count">0 / 500 words</span>
+      </div>
+      <textarea
+        id="input-text"
+        placeholder="Paste a paragraph you want to fact-check. Up to 500 words."
+        spellcheck="false"
+      ></textarea>
+      <div class="input-actions">
+        <button class="btn-ghost" id="btn-clear">Clear</button>
+        <button class="btn-primary" id="btn-check" disabled>Run check →</button>
+      </div>
+    </section>
+
+    <!-- Status bar -->
+    <div id="status-bar">
+      <div class="spinner"></div>
+      <span id="status-text">Extracting atomic claims…</span>
+    </div>
+
+    <!-- Error block -->
+    <div id="error-block"></div>
+
+    <!-- Summary bar -->
+    <div id="summary-bar">
+      <div class="summary-header">
+        <div id="overall-verdict" class="summary-verdict"></div>
+        <div class="summary-stats">
+          <div class="stat-item">
+            <div class="stat-dot green"></div>
+            <span id="stat-supports">0 supported</span>
+          </div>
+          <div class="stat-item">
+            <div class="stat-dot red"></div>
+            <span id="stat-refutes">0 refuted</span>
+          </div>
+          <div class="stat-item">
+            <div class="stat-dot yellow"></div>
+            <span id="stat-nei">0 uncertain</span>
+          </div>
+        </div>
+      </div>
+      <!-- Time bar: stacked per-stage durations from response.timings -->
+      <div id="time-bar-wrap">
+        <div id="time-bar"></div>
+        <div id="time-legend"></div>
+      </div>
+    </div>
+
+    <!-- Results section -->
+    <section id="results-section">
+      <div class="results-label">Claims</div>
+      <div id="results-list"></div>
+    </section>
+
+    <footer>
+      <span>Wikipedia · phi3:mini · qwen3:8b · spaCy</span>
+      <span id="perf-label"></span>
+    </footer>
+
+  </div>
+
+  <script>
+    // ── Config ────────────────────────────────────────────────────────────────
+    // API_BASE: Backend URL. Adjust if FastAPI runs on a different port.
+    const API_BASE  = "http://localhost:8000";
+    const CHECK_URL = `${API_BASE}/check`;
+    const MAX_WORDS = 500;
+    const WARN_WORDS = 420;  // turn word count yellow before hitting the ceiling
+
+    // ── DOM refs ──────────────────────────────────────────────────────────────
+    const inputEl        = document.getElementById("input-text");
+    const wordCountEl    = document.getElementById("word-count");
+    const btnCheck       = document.getElementById("btn-check");
+    const btnClear       = document.getElementById("btn-clear");
+    const statusBar      = document.getElementById("status-bar");
+    const statusText     = document.getElementById("status-text");
+    const errorBlock     = document.getElementById("error-block");
+    const summaryBar     = document.getElementById("summary-bar");
+    const overallVerdict = document.getElementById("overall-verdict");
+    const statSupports   = document.getElementById("stat-supports");
+    const statRefutes    = document.getElementById("stat-refutes");
+    const statNei        = document.getElementById("stat-nei");
+    const timeBar        = document.getElementById("time-bar");
+    const timeLegend     = document.getElementById("time-legend");
+    const resultsList    = document.getElementById("results-list");
+    const resultsSection = document.getElementById("results-section");
+    const perfLabel      = document.getElementById("perf-label");
+
+    // ── Word count & input validation ─────────────────────────────────────────
+    function countWords(text) {
+      return text.trim() === "" ? 0 : text.trim().split(/\s+/).length;
+    }
+
+    inputEl.addEventListener("input", () => {
+      const words = countWords(inputEl.value);
+      wordCountEl.textContent = `${words} / ${MAX_WORDS} words`;
+
+      wordCountEl.classList.toggle("warn",  words >= WARN_WORDS && words < MAX_WORDS);
+      wordCountEl.classList.toggle("limit", words >= MAX_WORDS);
+
+      btnCheck.disabled = words === 0 || words > MAX_WORDS;
+    });
+
+    // ── Clear ─────────────────────────────────────────────────────────────────
+    btnClear.addEventListener("click", () => {
+      inputEl.value = "";
+      inputEl.dispatchEvent(new Event("input"));
+      hide(summaryBar);
+      hide(resultsSection);
+      hide(errorBlock);
+      hide(statusBar);
+      resultsList.innerHTML = "";
+      perfLabel.textContent = "";
+    });
+
+    // ── UI helpers ────────────────────────────────────────────────────────────
+    function show(el) { el.classList.add("visible"); }
+    function hide(el) { el.classList.remove("visible"); }
+
+    function setStatus(msg) {
+      statusText.textContent = msg;
+      show(statusBar);
+    }
+
+    function showError(msg) {
+      errorBlock.textContent = msg;
+      show(errorBlock);
+    }
+
+    // ── Time bar rendering ────────────────────────────────────────────────────
+    // Stage keys arrive in response.timings (seconds). "Other" is the wall
+    // time not attributed to a stage (NER, chunking, URL resolution, etc.).
+    const STAGE_META = [
+      ["extraction_s",   "Extraction",   "#5b8fff"],
+      ["retrieval_s",    "Retrieval",    "#f0c040"],
+      ["verification_s", "Verification", "#ff5b8f"],
+      ["other_s",        "Other",        "#3e3e50"],
+    ];
+
+    function renderTimeBar(t) {
+      timeBar.innerHTML    = "";
+      timeLegend.innerHTML = "";
+
+      const total = t.total_s || 0;
+      if (!total) return;
+
+      const known = (t.extraction_s || 0) + (t.retrieval_s || 0) + (t.verification_s || 0);
+      const vals  = { ...t, other_s: Math.max(0, total - known) };
+
+      for (const [key, label, color] of STAGE_META) {
+        const v = vals[key] || 0;
+        if (v < 0.05) continue;
+
+        const seg = document.createElement("div");
+        seg.className        = "time-seg";
+        seg.style.width      = `${(v / total) * 100}%`;
+        seg.style.background = color;
+        seg.title            = `${label}: ${v.toFixed(1)}s`;
+        timeBar.appendChild(seg);
+
+        const item = document.createElement("div");
+        item.className = "legend-item";
+        item.innerHTML = `<span class="legend-swatch" style="background:${color}"></span>${label} ${v.toFixed(1)}s`;
+        timeLegend.appendChild(item);
+      }
+    }
+
+    // ── Label → color token ───────────────────────────────────────────────────
+    // Mirror postprocessor.LABEL_COLORS so the badge class matches
+    // the color token the backend sends in label_color.
+    function colorClass(labelColor) {
+      const map = { green: "green", red: "red", yellow: "yellow" };
+      return map[labelColor] || "yellow";
+    }
+
+    // ── Render one fact row ───────────────────────────────────────────────────
+    function renderFactRow(result, index) {
+      const color  = colorClass(result.label_color);
+      const rowId  = `evidence-${index}`;
+
+      // Per-claim timing line (from result.timings, seconds)
+      const tm = result.timings || {};
+      const fmtSec = v => (v == null ? "–" : `${Number(v).toFixed(1)}s`);
+      const hasTimings = tm.extraction_s != null || tm.retrieval_s != null || tm.verification_s != null;
+      const timingLine = hasTimings
+        ? `extraction ${fmtSec(tm.extraction_s)} · retrieval ${fmtSec(tm.retrieval_s)} · verification ${fmtSec(tm.verification_s)}`
+        : "";
+
+      // Map label value to display text
+      const labelText = {
+        "SUPPORTS":        "Supports",
+        "REFUTES":         "Refutes",
+        "NOT ENOUGH INFO": "Uncertain",
+      }[result.label] || result.label;
+
+      const row = document.createElement("div");
+      row.className = "fact-row";
+      row.style.animationDelay = `${index * 60}ms`;
+      row.innerHTML = `
+        <div class="fact-index">${String(index + 1).padStart(2, "0")}</div>
+        <div class="fact-body">
+          <div class="fact-claim-row">
+            <div class="fact-claim">${escapeHtml(result.claim)}</div>
+            <span class="label-badge ${color}">${labelText}</span>
+          </div>
+          <div class="fact-meta">
+            <div class="meta-line">
+              <span class="meta-key">Rationale</span>
+              <span class="meta-value">${escapeHtml(result.rationale)}</span>
+            </div>
+            ${timingLine ? `
+            <div class="meta-line">
+              <span class="meta-key">Timing</span>
+              <span class="meta-value">${timingLine}</span>
+            </div>` : ""}
+            <div class="meta-line">
+              <span class="meta-key">Source</span>
+              <span class="meta-value">
+                <a href="${escapeHtml(result.source_url)}" target="_blank" rel="noopener">
+                  ${escapeHtml(result.source_url)}
+                </a>
+              </span>
+            </div>
+            <div class="meta-line">
+              <span class="meta-key"></span>
+              <span class="meta-value">
+                <button class="evidence-toggle" data-target="${rowId}">
+                  <i class="toggle-arrow">▶</i> Evidence chunk
+                </button>
+                <div class="evidence-body" id="${rowId}">
+                  ${escapeHtml(result.evidence)}
+                </div>
+              </span>
+            </div>
+          </div>
+        </div>
+      `;
+
+      // Wire evidence toggle
+      const toggleBtn = row.querySelector(".evidence-toggle");
+      const evidenceDiv = row.querySelector(`#${rowId}`);
+      toggleBtn.addEventListener("click", () => {
+        const isOpen = evidenceDiv.classList.toggle("open");
+        toggleBtn.classList.toggle("open", isOpen);
+      });
+
+      return row;
+    }
+
+    // ── XSS guard ─────────────────────────────────────────────────────────────
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g,  "&amp;")
+        .replace(/</g,  "&lt;")
+        .replace(/>/g,  "&gt;")
+        .replace(/"/g,  "&quot;")
+        .replace(/'/g,  "&#039;");
+    }
+
+    // ── Main check flow ───────────────────────────────────────────────────────
+    btnCheck.addEventListener("click", async () => {
+      const text = inputEl.value.trim();
+      if (!text) return;
+
+      // Reset UI state
+      hide(summaryBar);
+      hide(resultsSection);
+      hide(errorBlock);
+      resultsList.innerHTML = "";
+      perfLabel.textContent = "";
+
+      btnCheck.disabled = true;
+      setStatus("Extracting atomic claims…");
+
+      const t0 = performance.now();
+
+      // Declared outside try so the finally block can always clear it —
+      // otherwise a rejected fetch skips clearTimeout and the status bar
+      // reappears on top of the error message 3s later.
+      let timeoutId = null;
+
+      try {
+        // ── Fetch ──────────────────────────────────────────────────────────────
+        // Update status text partway through to give the user a sense of
+        // pipeline progress. The actual stages are sequential in the backend
+        // and the total wait is typically 10-40s depending on GPU speed,
+        // so a single intermediate message is enough to confirm the page isn't frozen.
+        timeoutId = setTimeout(
+          () => setStatus("Retrieving Wikipedia evidence & verifying…"),
+          3000
+        );
+
+        const response = await fetch(CHECK_URL, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify({ text }),
+        });
+
+        if (!response.ok) {
+          // Surface the FastAPI error detail to the developer
+          let detail = `Server error ${response.status}`;
+          try {
+            const err = await response.json();
+            detail = err.detail || detail;
+          } catch (_) {}
+          throw new Error(detail);
+        }
+
+        const data = await response.json();
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+
+        // ── Render summary bar ─────────────────────────────────────────────────
+        const s = data.summary;
+        const verdictColor = {
+          "SUPPORTS":        "green",
+          "REFUTES":         "red",
+          "NOT ENOUGH INFO": "yellow",
+        }[data.overall_label] || "yellow";
+
+        overallVerdict.textContent = data.overall_label;
+        overallVerdict.className   = `summary-verdict ${verdictColor}`;
+        statSupports.textContent   = `${s.SUPPORTS} supported`;
+        statRefutes.textContent    = `${s.REFUTES} refuted`;
+        statNei.textContent        = `${s["NOT ENOUGH INFO"]} uncertain`;
+        renderTimeBar(data.timings || {});
+        show(summaryBar);
+
+        // ── Render results ─────────────────────────────────────────────────────
+        data.results.forEach((result, i) => {
+          resultsList.appendChild(renderFactRow(result, i));
+        });
+
+        show(resultsSection);
+        perfLabel.textContent = `${data.total_claims} claims · ${elapsed}s`;
+
+        // Scroll to results smoothly
+        summaryBar.scrollIntoView({ behavior: "smooth", block: "start" });
+
+      } catch (err) {
+        showError(`Error: ${err.message}`);
+      } finally {
+        clearTimeout(timeoutId);
+        hide(statusBar);
+        btnCheck.disabled = countWords(inputEl.value) === 0;
+      }
+    });
+  </script>
+</body>
+</html>

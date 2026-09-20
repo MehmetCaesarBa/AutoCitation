@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Model weights
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub rejects any single file over 100 MB on a normal push, and Git LFS's
+# free tier provides only 1 GiB of storage — so autocitation-extractor.q4_k_m.gguf
+# (2.2 GB) cannot be committed by either route.
+#
+# It does not need to be. Everything required to regenerate it already lives in
+# this repo: Backend/finetune/ holds the Modelfile, the Colab training
+# notebook, build_dataset.py, and data/ (2.7 MB of train/val JSONL). Publish the
+# built weights on Hugging Face Hub and link them from the README instead —
+# weights are a build artefact, the recipe is the source.
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets and local configuration
+# ─────────────────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Editors and OS
+# ─────────────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deliberately NOT ignored
+# ─────────────────────────────────────────────────────────────────────────────
+# Backend/regression_baseline.json — timings vary by machine, but the recorded
+#   LABELS are the point of the file: diffing them is how a prompt change that
+#   silently breaks a verdict gets caught.
+# Backend/finetune/data/*.jsonl — 2.7 MB total, well under any limit, and the
+#   training set is what makes the fine-tune reproducible.

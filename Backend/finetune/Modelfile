@@ -1,0 +1,22 @@
+FROM ./autocitation-extractor.q4_k_m.gguf
+
+# Explicit Phi-3-mini-instruct chat template — matches what
+# tokenizer.apply_chat_template() produced during training in the Colab
+# notebook (cell 4: {"role": "user", ...} / {"role": "assistant", ...}
+# with no system turn). Without this, Ollama auto-detects a template from
+# the GGUF's metadata and can guess wrong (it picked "zephyr" here), which
+# wraps every prompt in a format the fine-tuned model never saw — causing
+# generic, off-task replies regardless of how good the fine-tune actually is.
+TEMPLATE """{{ if .System }}<|system|>
+{{ .System }}<|end|>
+{{ end }}{{ if .Prompt }}<|user|>
+{{ .Prompt }}<|end|>
+{{ end }}<|assistant|>
+{{ .Response }}<|end|>
+"""
+
+PARAMETER stop "<|end|>"
+PARAMETER stop "<|endoftext|>"
+PARAMETER stop "<|user|>"
+PARAMETER stop "<|assistant|>"
+PARAMETER temperature 0.2
