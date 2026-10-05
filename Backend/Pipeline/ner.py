@@ -1,6 +1,5 @@
 import re
 import spacy
-import pytest
 
 # ── spaCy model ───────────────────────────────────────────────────────────────
 # Run once to download: python -m spacy download en_core_web_sm
@@ -42,6 +41,35 @@ ENTITY_PRIORITY = {
     #     spaCy tags them FAC, not GPE/ORG, so only the DATE survived and
     #     every landmark query fell through to keyword fallback.
     "FAC"    : 5,
+
+    # 5c. LAW: Named documents made into law or policy — treaties, acts,
+    #     amendments, doctrines, plans (e.g., "the Marshall Plan", "the Treaty
+    #     of Versailles", "the First Amendment"). THE SAME BUG AS FAC ABOVE,
+    #     one label later.
+    #
+    #     spaCy tagged it correctly the whole time; extract_entities dropped it,
+    #     because the filter is `ent.label_ in ENTITY_PRIORITY` and LAW had no
+    #     key. A live run:
+    #
+    #         claim    "This financial rescue program was formally designated
+    #                   as the Marshall Plan."
+    #         spaCy    [('the Marshall Plan', 'LAW')]
+    #         filtered []
+    #         queries  ['financial rescue program', 'program']
+    #         article  Troubled Asset Relief Program        <- 2008, not 1948
+    #         verdict  NOT ENOUGH INFO
+    #
+    #     The one term that identifies the topic was sitting in the claim,
+    #     recognised by the tagger, and thrown away — so the query fell through
+    #     to the grammatical subject, 'financial rescue program' matched a
+    #     bank-bailout article from sixty years later, and the verifier
+    #     correctly reported that this evidence says nothing about the claim.
+    #     A retrieval failure wearing a verdict's clothes.
+    #
+    #     Priority 5, alongside EVENT and FAC: a named document is as specific
+    #     an anchor as a named building. Deliberately above GPE — for this
+    #     claim 'the Marshall Plan' is worth more than any country in it.
+    "LAW"    : 5,
 
     # 6. PERSON: Individual historical figures, authors, or developers.
     #    Highest priority because unique proper names are the strongest search anchors in knowledge bases.
@@ -713,6 +741,81 @@ def is_superlative(token) -> bool:
     return token.tag_ in _SUPERLATIVE_TAGS or token.lemma_.lower() in _SUPERLATIVE_LEMMAS
 
 
+def superlative_type_word(fact: str) -> str | None:
+    """
+    The noun a superlative claim ranks WITHIN — 'settlement', 'animal', 'zone'.
+
+    Returns None when the claim carries no superlative, or when no noun governs
+    the one it has.
+
+    READS THE CLAIM, NOT THE QUERY. program._type_word answers the same question
+    from build_predicate_query's output, and its docstring records three separate
+    failures caused by doing so: that output is "a keyword fragment, not a
+    sentence", so en_core_web_sm re-parses it by the rightward-compounding rule
+    and roots the whole span on its last word. Each fix narrowed which last word
+    got taken — chunk root, then first NOUN, then last NOUN — and every version
+    was a better guess at a structure the fragment no longer contains.
+
+    The fragment lost that structure because the prepositions were stripped.
+    "the largest living terrestrial animal ON EARTH TODAY" becomes 'largest
+    living terrestrial animal Earth today', where nothing distinguishes the
+    category from the scope; in the original sentence the scope sits under a
+    preposition and the category does not.
+
+    THE LAST-NOUN RULE HOLDS ONLY WHILE THE SCOPE IS A PROPER NOUN. _type_word's
+    own comment says so: "THE SCOPE ENTITY IS ALWAYS PROPN, BY CONSTRUCTION ...
+    the trailing scope ('United States', 'East Asia') is always the proper noun
+    at the end". True for those examples, false in general — 'on the planet',
+    'in history', 'on Earth today' all end in a COMMON noun, so the last NOUN is
+    the scope and the rule returns it. Measured:
+
+        'expansive subtropical arid zone planet'        -> 'planet'   (want 'zone')
+        'gigantic creature history'                     -> 'history'  (want 'creature')
+        'largest living terrestrial animal Earth today' -> 'today'    (want 'animal')
+        'largest animal'                                -> 'animal'   correct
+        'earliest European permanent settlement ...'     -> 'settlement' correct
+
+    Fed downstream that produces the instruction "The answer is the today
+    itself — its own name" for a question about an animal, and
+    _answer_is_right_kind then type-checks the answer against 'today'.
+
+    SO ASK THE SENTENCE INSTEAD. A superlative modifies the thing it ranks, so
+    walking up the dependency tree from the superlative token to the nearest NOUN
+    ancestor names the category directly. That walk crosses the adjective in
+    'most expansive zone' (most -advmod-> expansive -amod-> zone) and stops at
+    the first noun, and it never enters a prepositional phrase because the scope
+    is a sibling of the category, not its head.
+
+    Measured on the real parse, 5/5 including the case that motivated
+    _type_word:
+
+        "...the most expansive subtropical arid zone on the planet."   -> 'zone'
+        "...the most gigantic creature known to have existed..."       -> 'creature'
+        "...the largest living terrestrial animal on Earth today."     -> 'animal'
+        "...the earliest European permanent settlement in the US."     -> 'settlement'
+        "...the largest animal known to have lived."                   -> 'animal'
+
+    Only the FIRST superlative is consulted. A claim with two ("the first and
+    largest...") ranks one category, and both markers modify the same noun.
+    """
+    doc = NLP(fact)
+
+    superlatives = [t for t in doc if is_superlative(t)]
+    if not superlatives:
+        return None
+
+    node = superlatives[0]
+    # Bounded by the sentence: doc roots are their own head in spaCy, so the
+    # `node.head is node` test is the loop's terminator, not a guard against a
+    # cycle that cannot occur.
+    while True:
+        if node.pos_ == "NOUN":
+            return node.text.lower()
+        if node.head is node:
+            return None
+        node = node.head
+
+
 def build_predicate_query(fact: str) -> str | None:
     """
     A query for the CATEGORY a superlative claim ranks within, not for its subject.
@@ -775,11 +878,75 @@ def build_predicate_query(fact: str) -> str | None:
 
     start = min(t.i for t in superlatives)
 
+    # THE SUPERLATIVE MARKER WAS BEING DELETED FROM THE QUERY THAT DEPENDS ON IT.
+    #
+    # English marks a superlative two ways. An INFLECTED superlative carries it
+    # in the adjective ('largest', 'earliest', 'tallest'); an ANALYTIC one uses a
+    # separate adverb ('most gigantic', 'most expansive', 'least developed').
+    # Roughly, adjectives of one or two syllables inflect and longer ones take
+    # 'most' — so the analytic form covers the longer, more technical half of the
+    # vocabulary, which is the half encyclopedic prose is written in.
+    #
+    # Measured, en_core_web_sm on "the most expansive ... zone":
+    #
+    #     most        tag=RBS  pos=ADV  is_stop=True
+    #     expansive   tag=JJ   pos=ADJ  is_stop=False
+    #
+    # 'largest' is JJS/ADJ/not-stop and passes the POS whitelist below. 'most' is
+    # stopped by `is_stop` one line earlier, and the whitelist would have
+    # excluded it anyway for being ADV — two independent reasons, either one
+    # sufficient. Observed output:
+    #
+    #     "the most gigantic creature ... in history"
+    #         -> 'gigantic creature history'
+    #     "the most expansive subtropical arid zone on the planet"
+    #         -> 'expansive subtropical arid zone planet'
+    #
+    # NEITHER QUERY ASKS FOR A RECORD. is_superlative accepts RBS (it is in
+    # _SUPERLATIVE_TAGS, and the comment there names 'most' explicitly), so the
+    # claim IS routed down the superlative path — and then handed a query with
+    # the ranking removed. program._handle_question builds "What is the
+    # expansive subtropical arid zone planet?", a question no superlative
+    # appears in, and _handle_match compares the subject against whatever that
+    # returns. Same class of defect as the '10 1869 Promontory Summit Utah'
+    # query: a malformed question answered confidently.
+    #
+    # NOTHING BELOW CATCHES IT, because both guards test the query's SHAPE and
+    # the damage is to its MEANING. `len(keep) < 2` sees five tokens.
+    # `has_category_noun` sees 'arid', 'zone' and 'planet'. The query is
+    # well-formed by every test this function applies; it simply no longer
+    # ranks anything.
+    #
+    # NOT A GAP IN _SUPERLATIVE_LEMMAS. That set is read in exactly one place
+    # (is_superlative, below) and is a fallback for what the TAGGER misses.
+    # Measured: is_superlative('most') was already True via _SUPERLATIVE_TAGS,
+    # so adding 'most' to the lemma set changes nothing — detection was never
+    # the broken half. The defect is that this loop discards a token the
+    # detector had already accepted.
+    superlative_indices = {t.i for t in superlatives}
+
     keep = []
     has_category_noun = False
     for token in doc[start:]:
         if token.i in subject_indices or token.is_punct or token.is_space:
             continue
+
+        # Kept unconditionally: the marker is the one word the query cannot do
+        # without. This cannot change behaviour for inflected superlatives —
+        # those already reach `keep` through the ADJ branch below, and the
+        # `continue` prevents a second append.
+        if token.i in superlative_indices:
+            keep.append(token.text)
+            # Preserved from the general branch. A superlative lemma tagged NOUN
+            # ('the only', 'the original') used to satisfy the category check,
+            # and silently withdrawing that would start rejecting claims this
+            # function previously accepted.
+            if token.pos_ == "NOUN":
+                has_category_noun = True
+            if len(keep) >= _MAX_PREDICATE_TOKENS:
+                break
+            continue
+
         if token.is_stop or token.lemma_.lower() in _FRAMING_LEMMAS:
             continue
         # Keep content words only. Adjectives matter here as much as nouns —

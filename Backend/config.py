@@ -43,3 +43,25 @@ OLLAMA_BASE_URL: str = "http://localhost:11434"
 # window. Inputs beyond this limit would require chunking the input itself,
 # which is out of scope for the PoC.
 MAX_INPUT_WORDS: int = 500
+
+
+# ── Retrieval scoring ─────────────────────────────────────────────────────────
+# EMBED_MODEL: Ollama embedding model for dense retrieval scoring.
+# Read by retriever.embed_texts(). A small (~137M) embedding model, so it runs
+# on CPU in a few seconds even for the 30-90 chunks a claim retrieves — no GPU
+# and no PyTorch/transformers; it is reached over the same localhost Ollama HTTP
+# API the generative models use.
+EMBED_MODEL: str = "nomic-embed-text"
+
+# RETRIEVAL_SCORING: which scorer retriever.fetch() ranks chunks with.
+#   "idf"    — IDF-weighted exact-token overlap (the original, lexical only).
+#   "dense"  — cosine similarity of nomic-embed-text embeddings (paraphrase).
+#   "hybrid" — Reciprocal Rank Fusion of the two: a chunk must rank well on
+#              BOTH the lexical and the dense scorer to surface.
+#
+# DEFAULT IS "idf" ON PURPOSE. Dense and hybrid add a per-claim call to the
+# embedding endpoint; leaving the default lexical keeps behaviour, latency and
+# startup provisioning identical to before until this is explicitly flipped.
+# ollama_client.MODEL_ROLES reads this value and only enrolls EMBED_MODEL in
+# startup auto-pull when it is not "idf", so an "idf" run pulls nothing new.
+RETRIEVAL_SCORING: str = "hybrid"    # "idf" | "dense" | "hybrid"

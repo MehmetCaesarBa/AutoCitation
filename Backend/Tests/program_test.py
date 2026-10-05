@@ -9,6 +9,7 @@ rather than generating them with a model.
 
 import pytest
 
+from models import llm
 from Pipeline import program as prog
 
 
@@ -228,18 +229,19 @@ def test_units_are_normalised_before_comparison():
 # ═════════════════════════════════════════════════════════════════════════════
 # Kill switch
 # ═════════════════════════════════════════════════════════════════════════════
-def test_stats_logger_is_self_contained():
+def test_stats_logger_tolerates_missing_fields():
     """
     REGRESSION. The first release called ollama_client.log_inference_stats,
     which exists in some versions of this project and not others. Every program
     run raised AttributeError, the blanket handler swallowed it, and the feature
     was dead for a whole run with one quiet line of warning.
 
-    A module whose purpose is to work when the verifier cannot should not depend
-    on another module for a print statement.
+    The logger now lives in models.llm, the shared generation helper, and the
+    cross-module walk below checks every llm.* reference program.py makes. What
+    remains to pin here is that a sparse Ollama body cannot raise.
     """
-    prog._log_stats({"eval_count": 42, "eval_duration": 2_000_000_000}, "phi3:mini")
-    prog._log_stats({}, "phi3:mini")          # missing fields must not raise
+    llm.log_stats({"eval_count": 42, "eval_duration": 2_000_000_000}, "phi3:mini")
+    llm.log_stats({}, "phi3:mini")          # missing fields must not raise
 
 
 def test_every_cross_module_call_actually_exists():
@@ -247,7 +249,7 @@ def test_every_cross_module_call_actually_exists():
     The same defect caught structurally rather than by example.
 
     Walks program.py's syntax tree, collects every `module.attribute` reference
-    into ner and retriever, and asserts each one resolves. A helper that gets
+    into ner, retriever and llm, and asserts each one resolves. A helper that gets
     renamed or reverted out of another module now fails here in milliseconds
     instead of during a 700-second pipeline run, where it surfaced as one quiet
     fallback line that read like normal behaviour.
@@ -257,7 +259,7 @@ def test_every_cross_module_call_actually_exists():
 
     from Pipeline import ner, retriever
 
-    modules = {"ner": ner, "retriever": retriever}
+    modules = {"ner": ner, "retriever": retriever, "llm": llm}
     tree = ast.parse(pathlib.Path(prog.__file__).read_text(encoding="utf-8"))
 
     checked = 0
@@ -282,3 +284,75 @@ def test_program_mode_can_be_disabled(monkeypatch):
     """
     monkeypatch.setattr(prog, "PROGRAM_MODE", False)
     assert prog.try_verify("Jamestown is the earliest European settlement.") is None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Kind check — the claim restated about the answer, tested by NLI
+# ═════════════════════════════════════════════════════════════════════════════
+JAMESTOWN = "Jamestown is the earliest European permanent settlement in the United States."
+
+
+def test_hypothesis_puts_the_answer_in_place_of_the_subject():
+    assert prog._hypothesis("Saint Augustine", "q", JAMESTOWN, "Jamestown") == \
+        "Saint Augustine is the earliest European permanent settlement in the United States."
+
+
+def test_hypothesis_drops_the_answers_article_to_keep_the_claims_own():
+    assert prog._hypothesis("the Antarctic blue whale", "q",
+                            "The blue whale is the most gigantic creature in history.",
+                            "blue whale") == \
+        "The Antarctic blue whale is the most gigantic creature in history."
+
+
+def test_hypothesis_falls_back_to_the_question_without_a_claim():
+    assert prog._hypothesis("K2", "highest mountain Earth") == "K2 is the highest mountain Earth."
+
+
+def test_bare_number_is_rejected_before_nli(monkeypatch):
+    """Measured: NLI entails '1565 is the earliest ... settlement' at p=0.98
+    from '...at Saint Augustine, Florida (1565)'."""
+    monkeypatch.setattr(prog, "_entailment_scores",
+                        lambda *a: pytest.fail("a bare number must not reach NLI"))
+    assert not prog._answer_is_right_kind(
+        "1565", "q", ["...at Saint Augustine, Florida (1565)."],
+        claim=JAMESTOWN, subject="Jamestown")
+
+
+def test_kind_check_accepts_on_entailment_and_rejects_below_threshold(monkeypatch):
+    monkeypatch.setattr(prog, "_entailment_scores", lambda prem, hyp: [0.1, 0.9])
+    assert prog._answer_is_right_kind("Saint Augustine", "q", ["One. Two."],
+                                      claim=JAMESTOWN, subject="Jamestown")
+    monkeypatch.setattr(prog, "_entailment_scores", lambda prem, hyp: [0.1, 0.3])
+    assert not prog._answer_is_right_kind("Saint Augustine", "q", ["One. Two."],
+                                          claim=JAMESTOWN, subject="Jamestown")
+
+
+def test_premises_are_two_sentence_windows(monkeypatch):
+    """'It is the largest animal' must keep its referent from the sentence before."""
+    seen = {}
+    monkeypatch.setattr(prog, "_entailment_scores",
+                        lambda prem, hyp: seen.setdefault("p", prem) and [0.0] * len(prem))
+    prog._answer_is_right_kind("blue whale", "q", ["A. B. C."],
+                               claim="The blue whale is the largest animal.", subject="blue whale")
+    assert seen["p"] == ["A.", "A. B.", "B. C."]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("answer, claim, subject, evidence, expected", [
+    # Synonym + paraphrase: the case the substring check rejected.
+    ("blue whale", "The blue whale is the most gigantic creature in history.", "blue whale",
+     "The blue whale is a marine mammal. It is the largest animal known to have ever existed.",
+     True),
+    ("Saint Augustine", JAMESTOWN, "Jamestown",
+     "The Spanish were the first Europeans to establish a permanent settlement in what "
+     "became the United States, at Saint Augustine, Florida (1565).", True),
+    # The founder, named in the same sentence as 'settlement'.
+    ("Juan Ponce de León", JAMESTOWN, "Jamestown",
+     "Caparra, the first European settlement in Puerto Rico, was founded in 1508 by "
+     "Juan Ponce de León.", False),
+    ("Mount Everest", "K2 is the highest mountain in the world.", "K2",
+     "Mount Everest attracts many climbers. Climbing Mount Everest is dangerous.", False),
+])
+def test_kind_check_with_the_real_nli_model(answer, claim, subject, evidence, expected):
+    assert prog._answer_is_right_kind(answer, "q", [evidence],
+                                      claim=claim, subject=subject) is expected

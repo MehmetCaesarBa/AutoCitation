@@ -1,39 +1,10 @@
 import re
-from dataclasses import dataclass
 
-import requests
+from models import llm
+from Pipeline.results import VerificationResult
 
 # ── Ollama config ─────────────────────────────────────────────────────────────
-OLLAMA_URL      = "http://localhost:11434/api/generate"
 REASONING_MODEL = "qwen3:8b"
-
-
-# ── Result type ───────────────────────────────────────────────────────────────
-@dataclass(frozen=True)
-class VerificationResult:
-    """
-    A verdict, the chunk that produced it, and the one-line justification.
-
-    Deliberately NOT a tuple or NamedTuple. This module used to return three
-    bare strings, and the two functions that did so disagreed about the order:
-    parse_verification_response gave (label, evidence, rationale) while verify
-    gave (label, rationale, evidence). Positional unpacking cannot catch that
-    mistake — all three fields are strings, so a swap raises nothing and simply
-    puts a whole Wikipedia paragraph where a one-sentence rationale belongs,
-    surfacing much later as a puzzling frontend bug.
-
-    Attribute access removes the ordering from the interface entirely:
-    result.evidence cannot be confused with result.rationale at any call site.
-    Making it a NamedTuple would have preserved unpacking, and with it the
-    hazard, so unpacking is left deliberately unavailable — stale positional
-    code fails loudly instead of quietly.
-
-    frozen=True because a verdict is a record of what happened, not a mutable
-    working value.
-    """
-    label: str
-    evidence: str
-    rationale: str
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -92,37 +63,47 @@ VERIFIER_NUM_PREDICT = 256 if VERIFIER_THINKING is False else 3072
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1 — Call Ollama (reasoning model)
 # ─────────────────────────────────────────────────────────────────────────────
-def call_ollama(prompt: str) -> str:
-    """Send a prompt to the reasoning model and return the raw response string."""
-    payload = {
-        "model": REASONING_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        # Top-level field, NOT an option — see Ollama's /api/generate schema.
-        "think": VERIFIER_THINKING,
-        "options": {
-            "num_ctx": VERIFIER_NUM_CTX,
-            "num_predict": VERIFIER_NUM_PREDICT,
-            # Greedy decoding. Verification is a classification with one right
-            # answer; sampling only adds a chance of picking the second-best
-            # label. Ollama defaults to temperature 0.8, which this call was
-            # silently inheriting.
-            "temperature": 0.2,
-            "top_p": 1,
-            "top_k": 1,
-            "repeat_penalty": 1.0,
-            "seed": 0,
-        },
-    }
-    response = requests.post(OLLAMA_URL, json=payload)
-    response.raise_for_status()
-    raw = response.json()["response"]
+def request_options() -> dict:
+    """
+    The Ollama options for a verification call, built at CALL time.
 
-    # qwen3 emits <think>...</think> reasoning blocks by default. Strip them
-    # before parsing so leaked chain-of-thought can never be mistaken for
-    # the LABEL / EVIDENCE / RATIONALE fields.
-    cleaned = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL)
-    return cleaned.strip()
+    A function rather than a constant because verifier_probe and regression
+    reassign VERIFIER_THINKING / VERIFIER_NUM_PREDICT at runtime; a dict frozen
+    at import would ignore them. verifier_probe also sends exactly this, so the
+    probe measures what the pipeline runs.
+    """
+    return {
+        "num_ctx": VERIFIER_NUM_CTX,
+        "num_predict": VERIFIER_NUM_PREDICT,
+        # Greedy decoding. Verification is a classification with one right
+        # answer; sampling only adds a chance of picking the second-best
+        # label. Ollama defaults to temperature 0.8, which this call was
+        # silently inheriting.
+        "temperature": 0.2,
+        "top_p": 1,
+        "top_k": 1,
+        "repeat_penalty": 1.0,
+        "seed": 0,
+    }
+
+
+def call_ollama(prompt: str) -> str:
+    """
+    Send a prompt to the reasoning model and return the answer text.
+
+    Any <think> block is already stripped by llm.generate, so leaked
+    chain-of-thought can never be mistaken for the LABEL / EVIDENCE /
+    RATIONALE fields. Kept as a named function so tests can replace it.
+
+    Truncation is reported by llm.generate from Ollama's done_reason; verify()
+    still detects it independently from the missing LABEL line, so the guard
+    holds even when this function is replaced in a test.
+    """
+    return llm.generate(
+        REASONING_MODEL, prompt,
+        think=VERIFIER_THINKING,
+        options=request_options(),
+    ).text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -556,7 +537,7 @@ def parse_verification_response(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 — Core verify function
-# Called by main.py orchestrator, not by claim_extractor.py directly.
+# Called by verification.verify_claim on the single-shot path.
 # ─────────────────────────────────────────────────────────────────────────────
 def verify(fact: str, evidence_chunks: list[str]) -> VerificationResult:
     """

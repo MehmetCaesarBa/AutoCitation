@@ -197,7 +197,7 @@ app.add_middleware(
 # STEP 4 — (removed) Per-Fact Pipeline Runner
 # ─────────────────────────────────────────────────────────────────────────────
 # Retrieval + verification now happen inside claim_extractor's AFEV loop
-# (grounded_verify) — the paper's intended design: each fact is verified
+# (verification.verify_claim) — the paper's intended design: each fact is verified
 # against Wikipedia evidence the moment it is extracted, and that verified
 # result doubles as the feedback signal for the next extraction iteration.
 #

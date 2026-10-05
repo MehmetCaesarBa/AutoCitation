@@ -29,16 +29,14 @@ import re
 import sys
 import time
 
-import requests
-
 import Pipeline.verifier as verifier
+from models import llm
 
 # Read defensively. An earlier version of this file called a helper that exists
 # in some versions of ollama_client and not others; every probe run died on
 # AttributeError and the blanket handler made it look like normal behaviour.
 # Nothing here should break because a constant was renamed in a module this
 # file only borrows from.
-OLLAMA_URL = getattr(verifier, "OLLAMA_URL", "http://localhost:11434/api/generate")
 KEEP_ALIVE = getattr(verifier, "KEEP_ALIVE", "30m")
 
 
@@ -183,37 +181,34 @@ def call_raw(prompt: str) -> tuple[str, str, float]:
     """
     Post the prompt; return (answer, reasoning, seconds).
 
-    Options are imported from verifier so this cannot drift from what the
-    pipeline sends. The one deliberate difference: the reasoning is kept.
+    Options come from verifier.request_options() and go through the same
+    llm.generate the pipeline uses, so this cannot drift from what the pipeline
+    sends. (An earlier copy of the payload sent temperature 0 against the
+    pipeline's 0.2 — harmless under top_k=1, but exactly the drift this
+    docstring claimed was impossible.) The one deliberate difference: the
+    reasoning is kept, and the model is held loaded between cases.
     """
-    payload = {
-        "model": verifier.REASONING_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "think": verifier.VERIFIER_THINKING,
-        "keep_alive": KEEP_ALIVE,
-        "options": {
-            "num_ctx": verifier.VERIFIER_NUM_CTX,
-            "num_predict": verifier.VERIFIER_NUM_PREDICT,
-            "temperature": 0, "top_p": 1, "top_k": 1,
-            "repeat_penalty": 1.0, "seed": 0,
-        },
-    }
     t0 = time.perf_counter()
-    response = requests.post(OLLAMA_URL, json=payload)
-    response.raise_for_status()
+    gen = llm.generate(
+        verifier.REASONING_MODEL, prompt,
+        think=verifier.VERIFIER_THINKING,
+        keep_alive=KEEP_ALIVE,
+        options=verifier.request_options(),
+        log=False,
+    )
     elapsed = time.perf_counter() - t0
-    body = response.json()
 
-    tokens = body.get("eval_count", 0)
+    tokens = gen.eval_count
     print(f"    [{verifier.REASONING_MODEL}]  {tokens} tok in {elapsed:.1f}s "
-          f"({tokens / elapsed if elapsed else 0:.1f} tok/s)")
+          f"({tokens / elapsed if elapsed else 0:.1f} tok/s)"
+          f"{'   TRUNCATED at num_predict' if gen.truncated else ''}")
 
-    # REASONING ARRIVES IN ITS OWN FIELD when `think` is set — body["thinking"],
-    # not inline in body["response"]. A version of this probe searched the
-    # answer for a <think> block, found none, and printed "(no reasoning)" on a
-    # run that had just spent 2063 tokens reasoning.
-    return body.get("response", ""), body.get("thinking", "") or "", elapsed
+    # REASONING ARRIVES IN ITS OWN FIELD when `think` is set — "thinking",
+    # not inline in "response". A version of this probe searched the answer
+    # for a <think> block, found none, and printed "(no reasoning)" on a run
+    # that had just spent 2063 tokens reasoning. llm.generate returns it as
+    # gen.thinking; any inline block has already been stripped from gen.text.
+    return gen.text, gen.thinking, elapsed
 
 
 def set_thinking(value) -> None:

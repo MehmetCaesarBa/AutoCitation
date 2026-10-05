@@ -11,6 +11,7 @@ precisely why these bugs were cheap to find once anyone looked.
 import pytest
 
 from Pipeline import claim_extractor as ce
+from Pipeline import verification
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -245,7 +246,7 @@ def test_diagnosis_anchors_on_the_name_not_the_longest_word():
         "Spain and Portugal established a permanent settlement in the New World "
         "long before other European powers attempted one."
     ]
-    assert ce.diagnose_nei(
+    assert verification.diagnose_nei(
         "The English settlement of Jamestown paved the way for European presence.",
         chunks,
     ) == "RETRIEVAL_FAILURE"
@@ -257,7 +258,7 @@ def test_diagnosis_reports_genuine_when_the_name_is_present():
         "The Jamestown settlement in the Colony of Virginia was the first "
         "permanent English settlement in the Americas."
     ]
-    assert ce.diagnose_nei(
+    assert verification.diagnose_nei(
         "The English settlement of Jamestown paved the way for European presence.",
         chunks,
     ) == "GENUINE"
@@ -268,7 +269,7 @@ def test_diagnosis_falls_back_to_length_without_a_proper_noun():
     "water molecules" has no PROPN, so length remains the best available proxy
     for rarity. The fallback must still work rather than raising.
     """
-    assert ce.diagnose_nei(
+    assert verification.diagnose_nei(
         "Water molecules are held together by hydrogen bonds.",
         ["Ionic bonds form between oppositely charged particles."],
     ) in {"RETRIEVAL_FAILURE", "GENUINE", "UNKNOWN"}

@@ -33,6 +33,20 @@ MODEL_ROLES: dict[str, str] = {
     "reasoning" : "qwen3:8b",
 }
 
+# EMBED role is enrolled ONLY when retrieval actually uses embeddings.
+#
+# ensure_models_available() pulls every model in MODEL_ROLES at startup, so
+# unconditionally listing the embedder would make a fresh clone download it
+# even on an "idf" run that never embeds anything — breaking the promise that
+# the default scorer changes nothing, startup included. Gating on
+# config.RETRIEVAL_SCORING keeps "idf" a true no-op and provisions the embedder
+# exactly when "dense"/"hybrid" is selected. The existing AUTOCITATION_NO_AUTOPULL
+# escape hatch still applies — this only decides WHICH models the roster names,
+# not whether auto-pull runs. main.py needs no change: it already provisions
+# from this dict via ensure_models_available().
+if config.RETRIEVAL_SCORING != "idf":
+    MODEL_ROLES["embed"] = config.EMBED_MODEL
+
 # ── Registry sources for automatic pulling ────────────────────────────────────
 # Maps a LOCAL model name to the REGISTRY name it can be downloaded from.
 #

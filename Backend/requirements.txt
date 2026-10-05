@@ -3,5 +3,12 @@ uvicorn[standard]
 requests
 langchain-community
 wikipedia
+ddgs                 # DuckDuckGo search when retriever.SEARCH_PROVIDER = "ddgs"
 spacy
 pydantic
+# NLI kind check in Pipeline/program.py. CPU-only torch is enough and far smaller:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch
+transformers
+sentencepiece
+protobuf

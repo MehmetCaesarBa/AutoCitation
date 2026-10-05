@@ -50,13 +50,14 @@ than to a guess: this module can only ever move a verdict when it is confident,
 which keeps its failure mode "no help" instead of "new wrong answers".
 """
 
+import functools
 import re
 from dataclasses import dataclass, field
 
 import Pipeline.ner as ner
 import Pipeline.retriever as retriever
-
-import requests
+from models import llm
+from Pipeline.results import VerificationResult
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Master switch. False restores single-shot verification for every claim, which
@@ -64,13 +65,18 @@ import requests
 # superlatives" should be reproducible, not asserted.
 PROGRAM_MODE = True
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-ANSWER_MODEL = "phi3:mini"
+ANSWER_MODEL = "qwen3:8b"
 KEEP_ALIVE = "30m"
 
-# The Question() handler is EXTRACTIVE, not evaluative: "which name does this
-# passage give for X?" is a copying task, so the fast model is the right tool
-# and the reasoning model would be paying 100-600s for a job that needs none.
+# The Question() handler was on phi3:mini, on the reasoning that "which name does
+# this passage give for X?" is a copying task the fast model can do. Live runs
+# said otherwise: with the right articles retrieved it answered 'Natchitoches'
+# for the earliest European settlement in the US, and 'Perucetus colossus' then
+# 'Bruhathkayosaurus' for the most gigantic creature in history — three wrong
+# picks in three answers. Choosing WHICH name answers the question is a reading
+# comprehension judgement, not copying, so it now runs on the verifier's model.
+# Thinking is disabled (see _call_answer_model): the answer is one name, and a
+# <think> block would spend the whole ANSWER_NUM_PREDICT budget before it.
 #
 # The safety net is not the model's care, it is the containment check in
 # _answer_is_grounded: an answer whose words do not appear in the evidence is
@@ -82,6 +88,18 @@ ANSWER_NUM_PREDICT = 48
 # because this is a lookup over a category rather than a judgement about one
 # sentence — the answer may sit outside the top two.
 QUESTION_TOP_K = 4
+
+# The kind check (_answer_is_right_kind) is an NLI cross-encoder, not an Ollama
+# model: it classifies (evidence sentence, hypothesis) pairs as entailment /
+# neutral / contradiction and generates nothing. Trained on MNLI, FEVER and
+# ANLI — FEVER is itself Wikipedia fact-checking, which is this pipeline's task.
+# Runs on CPU through transformers; downloaded from Hugging Face on first use.
+NLI_MODEL = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
+
+# Minimum P(entailment) for an evidence window to count as stating the
+# hypothesis. Below it, the answer is rejected and the claim goes to NOT ENOUGH
+# INFO — the safe direction for this module's failure mode.
+ENTAILMENT_THRESHOLD = 0.5
 
 
 # ── Operator detection ────────────────────────────────────────────────────────
@@ -153,6 +171,27 @@ class Program:
     chunks: list[str] = field(default_factory=list)
     source_url: str = ""
     query: str = ""
+    # The category the superlative ranks within, read from the CLAIM's parse at
+    # synthesis time. Carried on the program because execute() has the claim and
+    # _handle_question does not — see ner.superlative_type_word for why deriving
+    # it from `query` instead is unreliable.
+    type_word: str = ""
+
+
+@dataclass(frozen=True)
+class ProgramOutcome:
+    """
+    What a program run produces: a verdict, plus where it came from.
+
+    Returned instead of a finished per-fact record. Building that record, and
+    timing the work, is verification.verify_claim's job for BOTH paths — this
+    module used to build its own copy "shaped like grounded_verify's" and fill
+    the timings with zeros for the caller to overwrite.
+    """
+    verdict: VerificationResult
+    kind: str
+    query: str
+    source_url: str
 
 
 # ── Synthesis ─────────────────────────────────────────────────────────────────
@@ -262,6 +301,10 @@ def _superlative_program(claim: str, doc, superlative) -> Program | None:
             Step("label", "Match", ("answer_1", subject)),
         ],
         query=category,
+        # Read from `claim`, not from `category`. The category query has had its
+        # prepositions stripped, which is exactly the information needed to tell
+        # the ranked type from the scope it is ranked within.
+        type_word=ner.superlative_type_word(claim) or "",
     )
 
 
@@ -300,56 +343,53 @@ def _comparative_program(claim: str, doc, comp, other: str) -> Program | None:
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
-def _retrieve(query: str, top_k: int) -> tuple[list[str], str]:
-    """Chunks for a free-text query, ranked by the retriever's own scorer."""
+def _retrieve(query: str, top_k: int,
+              rank_against: str | None = None) -> tuple[list[str], str]:
+    """
+    Chunks for a free-text query, ranked by retriever.rank_chunks — the same
+    scorer and selection the verifier path uses.
+
+    `query` selects the ARTICLES. `rank_against` selects the CHUNKS within them,
+    defaulting to `query` so every existing caller is unaffected.
+
+    They differ only on _handle_question's fallback path, where the subject name
+    fetches the right article but ranks its chunks near-uniformly — the subject
+    appears in most of them, so it discriminates nothing. The chunk that answers
+    is the one matching the CATEGORY, so fetch by subject and rank by category.
+    """
     articles = retriever.fetch_articles(query)
     if not articles:
         return [], ""
     chunks = retriever.chunk_articles(articles)
-    scored = retriever.score_chunks(query, chunks)
-    if not scored:
-        return [], ""
-    return [c for _, c, _ in scored[:top_k]], scored[0][2]
-
-
-def _log_stats(body: dict, tag: str) -> None:
-    """
-    Timing line for one inference, in the same shape the rest of the pipeline
-    prints.
-
-    WRITTEN LOCALLY RATHER THAN IMPORTED. The first version called
-    ollama_client.log_inference_stats, which exists in some versions of this
-    project and not others — a revert removed it, and the resulting
-    AttributeError took down every program run until the fallback caught it.
-    The module's whole value is being the path that works when the verifier
-    cannot decide, so it should not depend on a helper for a print statement.
-    Ten lines of duplication is the cheaper side of that trade.
-    """
-    ns = body.get("eval_duration") or 0
-    tokens = body.get("eval_count") or 0
-    seconds = ns / 1e9
-    rate = tokens / seconds if seconds else 0.0
-    print(f"[Inference] {tag:12} output {tokens:5d} tok in {seconds:6.1f}s ({rate:.1f} tok/s)")
+    # Ranked exactly as the verifier path ranks its evidence — see
+    # retriever.rank_chunks for why this must never be a separate scorer again.
+    return retriever.rank_chunks(rank_against or query, chunks, top_k=top_k)
 
 
 def _call_answer_model(prompt: str) -> str:
-    payload = {
-        "model": ANSWER_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "keep_alive": KEEP_ALIVE,
-        "options": {
+    """
+    One Question() inference through the shared llm.generate.
+
+    THE OLD REASON FOR NOT SHARING CODE HERE. The first version of this module
+    called ollama_client.log_inference_stats, which a revert removed, and the
+    AttributeError took down every program run. llm.py exists to be the small,
+    stable dependency that ollama_client was not, and
+    test_every_cross_module_call_actually_exists now walks references into it
+    as well, so a renamed helper fails a test rather than a 700-second run.
+    """
+    return llm.generate(
+        ANSWER_MODEL, prompt,
+        # The answer is one name; a <think> block would spend the whole
+        # ANSWER_NUM_PREDICT budget before it.
+        think=False,
+        keep_alive=KEEP_ALIVE,
+        options={
             "num_ctx": 4096,
             "num_predict": ANSWER_NUM_PREDICT,
             "temperature": 0, "top_p": 1, "top_k": 1,
             "repeat_penalty": 1.0, "seed": 0,
         },
-    }
-    response = requests.post(OLLAMA_URL, json=payload)
-    response.raise_for_status()
-    body = response.json()
-    _log_stats(body, ANSWER_MODEL)
-    return body["response"].strip()
+    ).text
 
 
 def _answer_is_grounded(answer: str, chunks: list[str]) -> bool:
@@ -357,7 +397,7 @@ def _answer_is_grounded(answer: str, chunks: list[str]) -> bool:
     Does every content word of the answer appear in the evidence?
 
     THE ONLY THING STANDING BETWEEN THIS MODULE AND A FABRICATED VERDICT. The
-    Question handler runs on phi3:mini, which knows a great deal about early
+    Question handler runs on an LLM, which knows a great deal about early
     American settlements and would happily answer from memory. An answer drawn
     from weights rather than from the retrieved text would then be compared
     against the claim's subject and could produce a confident REFUTES with a
@@ -373,9 +413,92 @@ def _answer_is_grounded(answer: str, chunks: list[str]) -> bool:
     return all(w in haystack for w in words)
 
 
-def _handle_question(query: str) -> tuple[str | None, list[str], str]:
+def _handle_question(query: str,
+                     fallback_queries: tuple[str, ...] = (),
+                     type_word: str = "",
+                     claim: str = "",
+                     subject: str = ""
+                     ) -> tuple[str | None, list[str], str, bool]:
     """
-    Question(query) -> the entity the evidence names, or None.
+    Question(query), retried against `fallback_queries` only if it finds nothing.
+
+    Fourth return value is `from_fallback`: True when the answer came from a
+    fallback query rather than from `query` itself.
+
+    A FALLBACK, DELIBERATELY NOT A POOL. ner.build_predicate_query's docstring
+    says the predicate query is "an ADDITIONAL query, never a replacement", and
+    ner.build_query does append it beside the entity queries — so the verifier
+    path already works that way. _superlative_program is the path that does not:
+    it sets query=category and _retrieve runs one fetch, so the subject's own
+    article is never read except by _handle_corroborate on the REFUTES branch.
+
+    Wiring the subject query in as documented is right. Wiring it in by POOLING
+    both into this step's evidence is not, and would undo the reason the
+    predicate query exists. That query's whole job is to reach the RIVAL —
+    Saint Augustine for the Jamestown claim — and it works BECAUSE the subject's
+    article is absent. Pool it back in and the model reads Jamestown-centric
+    prose, answers 'Jamestown', and _handle_match returns SUPPORTS: the precise
+    false SUPPORTS this module was built to prevent, readmitted through the back
+    door.
+
+    The asymmetry is the whole point. When a superlative claim is TRUE the
+    subject usually IS the record holder, so its own article legitimately
+    answers. When it is FALSE the subject's article structurally cannot name the
+    rival. Pooling therefore helps true claims and pushes false ones toward
+    SUPPORTS — one label restrained and not the other, which is bias rather
+    than caution, and the same trap rule 6 of the verifier prompt was rewritten
+    to escape.
+
+    Running the fallback ONLY when the primary attempt yields nothing keeps both
+    properties. A claim whose category query retrieves and answers never reaches
+    this path, so no currently-correct verdict can move; a claim whose category
+    query was too malformed to retrieve anything gets a second chance instead of
+    an automatic NOT ENOUGH INFO.
+
+    from_fallback is returned rather than merely logged because a SUPPORTS
+    reached this way rests on the subject asserting its own record — weaker than
+    an independent search for the holder — and execute() says so in the
+    rationale instead of presenting the two as equivalent.
+    """
+    answer, chunks, url = _question_once(query, type_word=type_word,
+                                         claim=claim, subject=subject)
+    if answer is not None:
+        return answer, chunks, url, False
+
+    for fallback in fallback_queries:
+        if not fallback or fallback == query:
+            continue
+        print(f"[Program] Question('{query}') found nothing — retrying with "
+              f"fallback query '{fallback}'.")
+        fb_answer, fb_chunks, fb_url = _question_once(
+            fallback, rank_against=query, type_word=type_word,
+            claim=claim, subject=subject,
+        )
+        if fb_answer is not None:
+            return fb_answer, fb_chunks, fb_url, True
+        # Keep whatever evidence was seen, so a NOT ENOUGH INFO still carries
+        # chunks and a citation rather than coming back empty.
+        chunks = chunks or fb_chunks
+        url = url or fb_url
+
+    return None, chunks, url, False
+
+
+def _question_once(query: str,
+                   rank_against: str | None = None,
+                   type_word: str = "",
+                   claim: str = "",
+                   subject: str = "") -> tuple[str | None, list[str], str]:
+    """
+    One Question attempt: retrieve, ask, validate. Returns the entity or None.
+
+    `rank_against` is passed through to _retrieve; the prompt and the kind check
+    both use it in preference to `query`, so the model is still asked the
+    CATEGORY question even when the articles were fetched by subject name.
+
+    `type_word` is supplied by the caller from the claim's own parse. It falls
+    back to _type_word(query) only when absent, which keeps this function usable
+    standalone and keeps its existing unit tests meaningful.
 
     Returns None rather than guessing whenever the evidence does not clearly
     answer, because None becomes NOT ENOUGH INFO downstream and a wrong name
@@ -406,12 +529,14 @@ def _handle_question(query: str) -> tuple[str | None, list[str], str]:
     preference an 8B-class model can still miss, not a guarantee, and
     defense in depth costs nothing extra here.
     """
-    chunks, url = _retrieve(query, QUESTION_TOP_K)
+    asked = rank_against or query
+
+    chunks, url = _retrieve(query, QUESTION_TOP_K, rank_against=rank_against)
     if not chunks:
         print(f"[Program] Question('{query}') — no evidence retrieved.")
         return None, [], ""
 
-    type_word = _type_word(query)
+    type_word = type_word or _type_word(asked) or ""
     if type_word:
         kind_rule = (
             f"- The answer is the {type_word} itself — its own name. Do NOT answer "
@@ -427,7 +552,7 @@ def _handle_question(query: str) -> tuple[str | None, list[str], str]:
 
 {evidence}
 
-Question: What is the {query}?
+Question: What is the {asked}?
 
 Rules:
 {kind_rule}
@@ -448,77 +573,163 @@ Answer:"""
               f"evidence, so it came from the model's own knowledge.")
         return None, chunks, url
 
-    if not _answer_is_right_kind(answer, query, chunks):
+    if not _answer_is_right_kind(answer, asked, chunks, claim=claim, subject=subject):
         return None, chunks, url
 
     print(f"[Program] Question('{query}') -> '{answer}'")
     return answer, chunks, url
 
 
-def _answer_is_right_kind(answer: str, query: str, chunks: list[str]) -> bool:
+class NLIUnavailable(RuntimeError):
+    """The NLI model could not be loaded: a setup defect, not a runtime condition."""
+
+
+@functools.lru_cache(maxsize=1)
+def _nli():
     """
-    Is the answer the same KIND of thing the question asked about?
+    (tokenizer, model, entailment_index), loaded once per process.
 
-    THE FAILURE THIS CATCHES. Asked "what was the earliest European permanent
-    SETTLEMENT in the United States?", the model answered **'Juan Ponce de
-    León'** — an explorer. Grounding passed, because the name does appear in the
-    evidence. Match then compared a person against a settlement, found they
-    differed, and returned REFUTES.
-
-    The verdict happened to be right. The reasoning was not, and the mechanism
-    was worse than useless: Match returns REFUTES for ANY grounded string that
-    is not the claim's subject, so "Virginia Company", "1565" or "the Atlantic
-    Ocean" would all have produced the same confident answer.
-
-    HOW IT CHECKS, AND WHY NOT WITH NER. spaCy would be the obvious tool —
-    reject the answer if it is tagged PERSON. It is also the wrong tool here:
-    this project's own logs show en_core_web_sm calling *Jamestown* a PERSON,
-    so it would very likely call *Saint Augustine* — a city named after a saint
-    — a PERSON too, and reject the correct answer.
-
-    So the check is positional instead of categorical. The query carries its own
-    type word ('settlement'), and a passage that answers the question will name
-    the answer IN THE SAME SENTENCE as that word:
-
-        "...to establish a permanent SETTLEMENT in what became the United
-         States, at SAINT AUGUSTINE, Florida (1565)."
-
-    A sentence about an explorer's voyages contains the name but not the type
-    word, so it fails. No tagger involved, and nothing to be wrong about.
-
-    FAILS OPEN. If the query has no usable type word, the check is skipped
-    rather than rejecting everything — an unverifiable answer should fall
-    through to NOT ENOUGH INFO by the normal route, not be blocked here.
-
-    A 'BY X' AGENT-CLAUSE REJECTION WAS TRIED HERE AND DROPPED. It caught
-    'Juan Ponce de León' being named right after 'founded... by' in the same
-    sentence as 'settlement' — a real gap, since co-occurrence alone accepted
-    him even with the correct type word. But it moved with _handle_question's
-    prompt fix (below), which tells the model directly to answer with the
-    {type_word}'s own name rather than a person connected to it, and the
-    extraction now returns the right name at the source instead of needing to
-    be caught afterward. Two fixes at once made it impossible to tell which
-    one was doing the work, and a positional English-grammar rule (which
-    prepositions introduce an agent vs. a location) is exactly the kind of
-    narrow heuristic this module's own docstring warns against accumulating.
-    If the prompt fix ever turns out not to hold on other phrasings, this is
-    the first place to look — but it should be re-added on new evidence of
-    that, not kept on the strength of the one case that motivated it.
+    Imported lazily so that importing this module, and every test that does not
+    reach the kind check, costs nothing and needs no torch. A missing package or
+    a failed download raises NLIUnavailable, which try_verify reports loudly
+    instead of letting it look like an ordinary retrieval failure.
     """
-    type_word = _type_word(query)
-    if not type_word:
+    try:
+        import torch  # noqa: F401  (transformers needs it; fail here, not deep inside)
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    except ImportError as e:
+        raise NLIUnavailable(
+            f"{e}. Install the NLI dependencies: pip install -r requirements.txt"
+        ) from e
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(NLI_MODEL)
+        model = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL).eval()
+    except OSError as e:
+        raise NLIUnavailable(f"could not load '{NLI_MODEL}': {e}") from e
+
+    # Read the label order from the model rather than hard-coding it: NLI
+    # checkpoints disagree on whether entailment is index 0 or 2.
+    labels = {name.lower(): i for i, name in model.config.id2label.items()}
+    return tokenizer, model, labels["entailment"]
+
+
+def _entailment_scores(premises: list[str], hypothesis: str) -> list[float]:
+    """P(entailment) of `hypothesis` given each premise, in one batched pass."""
+    import torch
+
+    tokenizer, model, entail = _nli()
+    inputs = tokenizer(premises, [hypothesis] * len(premises),
+                       truncation="only_first", max_length=512,
+                       padding=True, return_tensors="pt")
+    with torch.no_grad():
+        probs = model(**inputs).logits.softmax(dim=-1)
+    return probs[:, entail].tolist()
+
+
+def _hypothesis(answer: str, asked: str, claim: str = "", subject: str = "") -> str:
+    """
+    The claim restated about `answer` instead of its subject.
+
+        claim   'The blue whale is the most gigantic creature in history.'
+        subject 'blue whale',  answer 'Antarctic blue whale'
+        ->      'The Antarctic blue whale is the most gigantic creature in history.'
+
+    Falls back to "{answer} is the {asked}." when the subject cannot be found in
+    the claim, or when called without one (standalone use, unit tests).
+    """
+    answer = re.sub(r'^(the|a|an)\s+', '', answer.strip(), flags=re.I)
+    if claim and subject:
+        pattern = re.compile(re.escape(subject), re.I)
+        if pattern.search(claim):
+            # A function replacement, so a backslash in the answer is literal.
+            return pattern.sub(lambda _m: answer, claim, count=1)
+    return f"{answer} is the {asked}."
+
+
+def _answer_is_right_kind(answer: str, query: str, chunks: list[str],
+                          claim: str = "", subject: str = "") -> bool:
+    """
+    Does the evidence actually STATE that the answer holds the claim's record?
+
+    Asked by NLI: the claim is restated with the answer in place of its subject
+    (see _hypothesis), and an evidence window must ENTAIL that restatement with
+    P(entailment) >= ENTAILMENT_THRESHOLD.
+
+        premise     "The blue whale is the largest animal known to have ever
+                     existed."
+        hypothesis  "The blue whale is the most gigantic creature in history."
+                     -> entailment
+
+    THE FAILURE THIS CATCHES. Asked for the earliest European permanent
+    settlement in the United States, the answer model returned 'Juan Ponce de
+    León' — an explorer who does appear in the evidence, so grounding passed.
+    Match then returned REFUTES for a person compared against a settlement, and
+    it would have done the same for ANY grounded string: "Virginia Company",
+    "1565", "the Atlantic Ocean". "Juan Ponce de León is the earliest European
+    permanent settlement in the United States" is entailed by nothing, so the
+    answer is rejected here and the claim falls to NOT ENOUGH INFO instead.
+
+    WHAT IT REPLACED, AND WHY. The previous check was positional: accept the
+    answer if it appeared in the same sentence as a TYPE WORD ('settlement')
+    read off the query. Every part of that was a string rule standing in for a
+    judgement about meaning, and each broke on live input:
+
+      - the type word itself: _type_word returned 'states' (the scope) and then
+        'land' (a modifier) before being fixed, and still returns the scope
+        noun when the scope is a common noun ('planet', 'history');
+      - synonyms: evidence saying 'largest ANIMAL' failed a query about the
+        'most gigantic CREATURE', rejecting a correct answer;
+      - substrings: 'land' matched inside 'island';
+      - co-occurrence: Ponce de León passed whenever a sentence named him
+        alongside the word 'settlement' ("founded ... by Ponce de León");
+      - sentence splitting: 'St. Augustine' split at 'St.' and could never
+        co-occur with anything.
+
+    NLI needs no type word, reads synonyms and paraphrase, and tests the whole
+    predicate rather than one noun — so it also checks that the answer holds the
+    RECORD, not merely that it is the right kind of thing.
+
+    WINDOWS OF TWO SENTENCES. Each premise is a sentence plus the one before it,
+    so "It is the largest animal..." still has its referent, and a name split
+    across a bad sentence boundary ('St.' | 'Augustine, Florida') is rejoined.
+
+    FAILS CLOSED. No entailing window means rejection -> NOT ENOUGH INFO: this
+    module may only move a verdict when the evidence states the answer, never
+    on a guess. A model that cannot be loaded raises NLIUnavailable rather than
+    silently accepting or rejecting everything.
+    """
+    # A BARE NUMBER CANNOT NAME A NAMED SUBJECT'S RIVAL — and NLI accepts one.
+    # Measured on this model: "1565 is the earliest European permanent
+    # settlement in the United States" is entailed at p=0.98 by "...a permanent
+    # settlement ... at Saint Augustine, Florida (1565)", which reads the
+    # parenthesised year as another name for the place. Rejected on form, not
+    # meaning, and only when the subject itself contains a letter, so a claim
+    # about a year ("2016 was the hottest year") is unaffected.
+    if re.search(r'[a-z]', subject, re.I) and not re.search(r'[a-z]', answer, re.I):
+        print(f"[Program] Question('{query}') -> '{answer}' REJECTED — a bare "
+              f"number cannot be the rival of '{subject}'.")
+        return False
+
+    hypothesis = _hypothesis(answer, query, claim, subject)
+
+    premises = []
+    for chunk in chunks:
+        sents = _sentences(chunk)
+        premises += [" ".join(sents[max(0, i - 1):i + 1]) for i in range(len(sents))]
+    if not premises:
+        return False
+
+    scores = _entailment_scores(premises, hypothesis)
+    best = max(range(len(scores)), key=scores.__getitem__)
+
+    if scores[best] >= ENTAILMENT_THRESHOLD:
+        print(f"[Program] Kind check: '{hypothesis}' entailed "
+              f"(p={scores[best]:.2f}) by: \"{premises[best]}\"")
         return True
 
-    answer_low = answer.lower()
-    for chunk in chunks:
-        for sentence in _sentences(chunk):
-            low = sentence.lower()
-            if type_word in low and answer_low in low:
-                return True
-
-    print(f"[Program] Question('{query}') -> '{answer}' REJECTED — never appears "
-          f"in a sentence with '{type_word}', so it is probably not a "
-          f"{type_word} at all.")
+    print(f"[Program] Question('{query}') -> '{answer}' REJECTED — no evidence "
+          f"entails '{hypothesis}' (best p={scores[best]:.2f}).")
     return False
 
 
@@ -847,9 +1058,9 @@ def _handle_compare(a, b, subject: str, other: str, dimension: str,
 
 
 # ── Execution ─────────────────────────────────────────────────────────────────
-def execute(program: Program, claim: str) -> dict | None:
+def execute(program: Program, claim: str) -> ProgramOutcome | None:
     """
-    Run a program and return a result dict shaped like grounded_verify's.
+    Run a program and return its verdict with provenance.
 
     Returns None if execution could not proceed at all, which sends the caller
     back to single-shot verification rather than leaving the claim unchecked.
@@ -858,13 +1069,31 @@ def execute(program: Program, claim: str) -> dict | None:
         category = program.steps[0].args[0]
         subject = program.steps[1].args[1]
 
-        answer, chunks, url = _handle_question(category)
+        answer, chunks, url, from_fallback = _handle_question(
+            category,
+            fallback_queries=(subject,),
+            type_word=program.type_word,
+            claim=claim,
+            subject=subject,
+        )
         label, rationale = _handle_match(answer, subject)
 
         program.trace = [
-            f"answer_1 = Question('{category}') -> {answer or 'UNKNOWN'}",
+            f"answer_1 = Question('{category}'"
+            + (f", fallback='{subject}'" if from_fallback else "")
+            + f") -> {answer or 'UNKNOWN'}",
             f"label = Match(answer_1, '{subject}') -> {label}",
         ]
+
+        # A SUPPORTS that came from the subject's own article is not independent
+        # evidence of a ranking — it is the subject asserting its own record.
+        # Keep the label; say where it came from.
+        if from_fallback and label == "SUPPORTS":
+            rationale += (
+                f" Note: the category search for '{category}' returned no usable "
+                f"evidence, so this rests on '{subject}''s own article rather "
+                f"than an independent search for the record holder."
+            )
 
         # REFUTES rests on ONE retrieval call aimed at an artificial category
         # phrase — see _handle_corroborate for why that is not always trusted
@@ -916,25 +1145,24 @@ def execute(program: Program, claim: str) -> dict | None:
     for line in program.trace:
         print(f"[Program]   {line}")
 
-    return {
-        "claim": claim,
-        "label": label,
-        # The trace travels with the verdict. A program-guided answer that
-        # cannot show its steps has thrown away the reason for using one.
-        "rationale": rationale + "  [program: " + " ; ".join(program.trace) + "]",
-        "evidence": program.chunks[0] if program.chunks else "",
-        "nei_kind": None,
-        "ner_query": program.query,
-        "source_url": program.source_url,
-        "program_kind": program.kind,
-        "timings": {"retrieval_s": 0.0, "verification_s": 0.0},
-    }
+    return ProgramOutcome(
+        verdict=VerificationResult(
+            label=label,
+            evidence=program.chunks[0] if program.chunks else "",
+            # The trace travels with the verdict. A program-guided answer that
+            # cannot show its steps has thrown away the reason for using one.
+            rationale=rationale + "  [program: " + " ; ".join(program.trace) + "]",
+        ),
+        kind=program.kind,
+        query=program.query,
+        source_url=program.source_url,
+    )
 
 
-def try_verify(claim: str) -> dict | None:
+def try_verify(claim: str) -> ProgramOutcome | None:
     """
-    Entry point. Returns a result dict, or None when no program applies and the
-    caller should fall back to single-shot verification.
+    Entry point. Returns a ProgramOutcome, or None when no program applies and
+    the caller should fall back to single-shot verification.
     """
     if not PROGRAM_MODE:
         return None
@@ -949,6 +1177,14 @@ def try_verify(claim: str) -> dict | None:
 
     try:
         return execute(program, claim)
+
+    except NLIUnavailable as e:
+        # A setup defect, reported as loudly as a code defect below and for the
+        # same reason: the fallback keeps the claim, but the program path is off.
+        print(f"[Program] *** NLI MODEL UNAVAILABLE: {e}")
+        print(f"[Program] *** The claim falls back to the verifier, but the "
+              f"program path is NOT running until this is fixed.")
+        return None
 
     except (AttributeError, TypeError, NameError, KeyError, IndexError) as e:
         # A BUG, NOT A RUNTIME CONDITION — and the two must not look alike.

@@ -422,14 +422,11 @@ def process(pipeline_outputs: list[dict]) -> dict:
     main.py, assembles each into a structured result via assemble_result(),
     and returns the complete aggregated API response via aggregate().
 
-    Expected input format per dict (produced by main.py's orchestration loop):
-    {
-        "claim"     : str,   ← from claim_extractor
-        "label"     : str,   ← from verifier.verify() return[0]
-        "rationale" : str,   ← from verifier.verify() return[1]
-        "evidence"  : str,   ← from verifier.verify() return[2]
-        "ner_query" : str,   ← from ner.extract_queries(), stored by main.py
-    }
+    Expected input format per dict: a results.FactResult, built by
+    verification.verify_claim for both the program and single-shot paths, plus
+    the extraction loop's additions (timings.extraction_s, source_sentence).
+    Only claim, label, rationale, evidence, ner_query, source_url and timings
+    are read here.
 
     Integration note for main.py:
         At the end of the per-fact loop, collect results into a list and call:
