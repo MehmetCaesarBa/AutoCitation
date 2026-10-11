@@ -10,6 +10,7 @@ import models.ollama_client as ollama_client
 import Pipeline.claim_extractor as claim_extractor
 import Pipeline.postprocessor as postprocessor
 from config import MAX_INPUT_WORDS
+import backends
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,6 +35,20 @@ class CheckRequest(BaseModel):
           so that module remains independently testable.
     """
     text: str
+    # Which inference backend to run on, from the UI toggle. Defaults to local
+    # so an old client (or a direct curl without the field) behaves as before.
+    backend: str = "local"
+
+    @field_validator("backend")
+    @classmethod
+    def backend_must_be_known(cls, v: str) -> str:
+        v = (v or "local").strip().lower()
+        if v not in backends.VALID_BACKENDS:
+            raise ValueError(
+                f"Unknown backend '{v}'. Choose one of: "
+                f"{', '.join(sorted(backends.VALID_BACKENDS))}."
+            )
+        return v
 
     @field_validator("text")
     @classmethod
@@ -111,6 +126,10 @@ class CheckResponse(BaseModel):
     # Aggregated stage durations (extraction_s, retrieval_s, verification_s)
     # plus total_s — wall-clock time for the whole request.
     timings       : dict[str, float] = {}
+
+    # Which inference backend this request ran on ("local" | "runpod"), echoed
+    # so the UI can confirm the toggle took effect.
+    backend       : str = "local"
 
     # Optional human-readable explanation, populated only when the outcome needs
     # one. A response with zero claims is otherwise indistinguishable from a
@@ -272,6 +291,12 @@ def check(request: CheckRequest) -> CheckResponse:
     #
     # 400 because the caller can act on it; the zero-claim path below stays 200
     # because there the caller did nothing wrong.
+    # Route every generation and embedding in THIS request to the selected
+    # server (backends.py). Set before any pipeline call so the verifier, the
+    # program's Question, extraction, the rewrite and dense embedding all follow.
+    resolved = backends.set_backend(request.backend)
+    print(f"[Main] Inference backend: {request.backend} ({resolved})")
+
     rejection = claim_extractor.validate_input(request.text)
     if rejection is not None:
         print(f"[Main] Input rejected — {rejection}.")
@@ -336,6 +361,7 @@ def check(request: CheckRequest) -> CheckResponse:
             "results"       : [],
             "timings"       : {"total_s": round(elapsed, 2)},
             "message"       : reason,
+            "backend"       : request.backend,
         }
 
     print(f"[Main] {len(pipeline_outputs)} verified fact(s) extracted.")
@@ -355,6 +381,9 @@ def check(request: CheckRequest) -> CheckResponse:
     final_response.setdefault("timings", {})["total_s"] = round(
         time.perf_counter() - t_start, 2
     )
+
+    # Echo the backend this request ran on so the UI can confirm the toggle.
+    final_response["backend"] = request.backend
 
     print(
         f"[Main] /check complete — "

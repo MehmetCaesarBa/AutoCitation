@@ -129,6 +129,31 @@ _DIMENSIONS = {
     "old":      ("age", "year"),
 }
 
+# _NOUN_DIMENSIONS: dimension keyed by the NOUN a generic comparative modifies.
+#
+# _DIMENSIONS above is keyed by the ADJECTIVE, which is correct only when the
+# adjective itself names the dimension ("is TALLER", "is LONGER"). It is wrong
+# for an attributive comparative like "higher VELOCITY" or "higher fatality
+# RATE": there "higher" is a bare magnitude word and the dimension is the noun.
+# Reading the adjective in that case mapped every "higher X" to 'high' -> height
+# and produced, live, a fatality-rate claim "refuted" by comparing mountain
+# heights. See _comparative_program for which parse shape selects which table.
+#
+# Only nouns whose unit family the Quantity handler can actually read are listed
+# (length / count / year). A noun that is not here — velocity, rate, mass, area,
+# temperature — resolves to None and the claim declines to the verifier rather
+# than inventing a comparison in the wrong units.
+_NOUN_DIMENSIONS = {
+    "height":     ("height", "length"),
+    "elevation":  ("elevation", "length"),
+    "altitude":   ("altitude", "length"),
+    "length":     ("length", "length"),
+    "depth":      ("depth", "length"),
+    "width":      ("width", "length"),
+    "population": ("population", "count"),
+    "age":        ("age", "year"),
+}
+
 # Unit conversion to a canonical base. Length -> metres, count -> units,
 # year -> year. Only units that actually appear in encyclopedia prose.
 _UNIT_TO_BASE = {
@@ -252,10 +277,27 @@ def _find_comparative(doc):
     if than is None:
         return None
 
-    # The compared entity is the nominal governed by 'than'. Taking its whole
-    # subtree keeps multi-word names intact ('the Nile', 'Mount Kilimanjaro').
+    # The compared entity is the nominal governed by 'than'. Take its whole
+    # subtree so multi-word names stay intact ('the Nile', 'Mount Everest').
+    #
+    # PREFER THE DIRECT DEPENDENT of 'than' (its pobj) over a doc-order scan.
+    # The scan version matched the FIRST nominal after 'than', which for "than
+    # Mount Everest" is the compound modifier 'Mount' (a leaf whose subtree is
+    # just 'Mount'), truncating the entity. The pobj is 'Everest', and its
+    # subtree is the full 'Mount Everest'. Only if the parse attaches nothing
+    # to 'than' do we fall back to the positional scan.
+    # No POS filter on the pobj: spaCy mis-tags entity-like tokens ('K2' comes
+    # back ADJ, model numbers as NUM), but the DEPENDENCY 'pobj of than' is
+    # reliable where the tag is not. _noun_span keeps PROPN/NOUN/ADJ/NUM, so it
+    # recovers 'K2' and multi-word names from the chosen token's subtree.
+    pobj = next((t for t in doc if t.head.i == than.i and not t.is_punct), None)
+    if pobj is not None:
+        span = _noun_span(pobj)
+        if span:
+            return comp, span
+
     for token in doc:
-        if token.head.i == than.i or (token.i > than.i and token.pos_ in ("PROPN", "NOUN")):
+        if token.i > than.i and token.pos_ in ("PROPN", "NOUN"):
             span = _noun_span(token)
             if span:
                 return comp, span
@@ -323,11 +365,29 @@ def _comparative_program(claim: str, doc, comp, other: str) -> Program | None:
     if not subject:
         return None
 
-    dimension = _DIMENSIONS.get(comp.lemma_.lower())
+    # THE DIMENSION COMES FROM THE PARSE SHAPE, NOT ALWAYS THE ADJECTIVE.
+    #
+    # spaCy's dependency label on the comparative says where the dimension lives:
+    #
+    #   acomp  "X is TALLER / LONGER"    -> the adjective IS the dimension
+    #   amod   "higher VELOCITY / RATE"  -> the NOUN it modifies is the dimension
+    #   advmod "MORE populous / LESS deep" -> the adjective it modifies is it
+    #
+    # Reading `comp.lemma_` unconditionally (the old behaviour) was correct only
+    # for the first case; for "higher velocity" it mapped 'high' -> height and
+    # compared the wrong quantity. Each shape now reads from the right token.
+    if comp.dep_ == "amod" and comp.head.pos_ == "NOUN":
+        dimension = _NOUN_DIMENSIONS.get(comp.head.lemma_.lower())
+    elif comp.dep_ == "advmod" and comp.head.pos_ in ("ADJ", "ADV"):
+        dimension = _DIMENSIONS.get(comp.head.lemma_.lower())
+    else:
+        dimension = _DIMENSIONS.get(comp.lemma_.lower())
+
     if dimension is None:
-        # An unmapped comparative ('larger', 'better', 'more important') names
-        # no measurable dimension, or an ambiguous one. Decline rather than
-        # compare whatever numbers happen to be nearby.
+        # No measurable dimension this program can read (an ambiguous adjective
+        # like 'larger', or a noun like velocity/rate/mass it has no units for).
+        # Decline rather than compare whatever numbers happen to be nearby — the
+        # claim falls through to the verifier.
         return None
 
     name, family = dimension

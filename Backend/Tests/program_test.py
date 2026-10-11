@@ -356,3 +356,72 @@ def test_premises_are_two_sentence_windows(monkeypatch):
 def test_kind_check_with_the_real_nli_model(answer, claim, subject, evidence, expected):
     assert prog._answer_is_right_kind(answer, "q", [evidence],
                                       claim=claim, subject=subject) is expected
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Comparative dimension-from-noun — the "higher X" fix
+# ═════════════════════════════════════════════════════════════════════════════
+import pytest
+
+
+@pytest.mark.parametrize("claim", [
+    "K2 has a significantly higher fatality rate than Mount Everest.",
+    "Light travels at a higher velocity than sound.",
+])
+def test_attributive_higher_noun_declines_when_dimension_unmeasurable(claim):
+    """
+    THE K2-FATALITY BUG. "higher RATE / higher VELOCITY" is attributive (amod):
+    the comparative 'higher' is a bare magnitude word and the dimension is the
+    NOUN it modifies, not the adjective. Reading the adjective mapped 'high' to
+    height and 'refuted' a fatality-rate claim by comparing mountain heights.
+    Rate and velocity are not measurable by this program, so it must decline to
+    the verifier — never build a height comparison.
+    """
+    assert prog.synthesize(claim) is None
+
+
+def test_attributive_higher_noun_uses_the_noun_when_measurable():
+    """'higher ELEVATION' — amod on a mapped noun — compares elevations."""
+    p = prog.synthesize("Mount Everest has a higher elevation than K2.")
+    assert p is not None and p.kind == "comparative"
+    assert p.steps[0].args[1] == "elevation"
+    assert p.steps[1].args[0] == "K2"
+
+
+def test_analytic_more_populous_reads_the_modified_adjective():
+    """'MORE populous' — advmod on an adjective — resolves via the adjective."""
+    p = prog.synthesize("China is more populous than India.")
+    assert p is not None and p.kind == "comparative"
+    assert p.steps[0].args[1] == "population"
+    assert p.steps[1].args[0] == "India"
+
+
+def test_predicative_comparative_still_reads_the_adjective():
+    """Regression: 'is TALLER / is LONGER' (acomp) keeps reading the adjective."""
+    for claim, dim in [("Mount Everest is taller than K2.", "height"),
+                       ("The Amazon is longer than the Nile.", "length"),
+                       ("Lake Baikal is deeper than Lake Tanganyika.", "depth")]:
+        p = prog.synthesize(claim)
+        assert p is not None and p.steps[0].args[1] == dim, claim
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 'than'-object is not truncated to a compound modifier
+# ═════════════════════════════════════════════════════════════════════════════
+def test_than_object_keeps_the_full_name():
+    """
+    "than Mount Everest" used to yield 'Mount' — the doc-order scan matched the
+    compound modifier before the pobj. Taking the pobj's subtree keeps the whole
+    name.
+    """
+    p = prog.synthesize("Mount Everest is taller than Mount Kilimanjaro.")
+    assert p is not None and p.steps[1].args[0] == "Mount Kilimanjaro"
+
+
+def test_than_object_recovers_a_mistagged_entity():
+    """
+    spaCy tags 'K2' as ADJ, so a POS-filtered pobj would miss it. The dependency
+    'pobj of than' is trusted instead, and _noun_span keeps ADJ/NUM tokens.
+    """
+    p = prog.synthesize("Mount Everest is taller than K2.")
+    assert p is not None and p.steps[1].args[0] == "K2"

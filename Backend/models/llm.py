@@ -25,8 +25,12 @@ from dataclasses import dataclass
 import requests
 
 import config
+import backends
 
-GENERATE_URL = f"{config.OLLAMA_BASE_URL}/api/generate"
+# The generation endpoint is resolved PER CALL from backends.generate_url(), not
+# fixed at import, so the Local/RunPod toggle moves every generation this helper
+# makes. config.OLLAMA_BASE_URL remains the default inside backends when no
+# request has selected one (startup, tests, scripts).
 
 _THINK_BLOCK = re.compile(r'<think>.*?</think>', re.DOTALL)
 
@@ -93,7 +97,7 @@ def generate(model: str, prompt: str, *,
     if keep_alive is not None:
         payload["keep_alive"] = keep_alive
 
-    response = requests.post(GENERATE_URL, json=payload, timeout=timeout)
+    response = requests.post(backends.generate_url(), json=payload, timeout=timeout)
     response.raise_for_status()
     body = response.json()
 

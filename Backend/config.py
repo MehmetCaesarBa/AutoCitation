@@ -31,7 +31,24 @@
 # Read by ollama_client.pull_model() to build the /api/pull endpoint.
 # Changing the port or moving Ollama to a remote host during development
 # requires editing exactly one line here.
-OLLAMA_BASE_URL: str = "http://localhost:11434"
+# OLLAMA_LOCAL_URL / OLLAMA_RUNPOD_URL: the two inference backends the UI toggle
+# picks between (see backends.py). "local" is this machine's Ollama; "runpod" is
+# a rented GPU reached through an SSH tunnel on a DISTINCT local port, so it does
+# not collide with the local server:
+#
+#     ssh -L 11435:localhost:11434 root@<pod-ip> -p <pod-ssh-port> -N
+#
+# With that tunnel up, http://localhost:11435 reaches the pod's Ollama. If you
+# prefer RunPod's HTTP proxy instead of a tunnel, put that URL here — but the
+# tunnel keeps the (auth-less) Ollama off the public internet.
+OLLAMA_LOCAL_URL:  str = "http://localhost:11434"
+OLLAMA_RUNPOD_URL: str = "http://localhost:11435"
+
+# OLLAMA_BASE_URL: the DEFAULT/startup target. ollama_client's provisioning and
+# health check use it (they run once at startup, against the local instance that
+# this machine is responsible for). Per-REQUEST routing is handled by backends.py
+# and overrides this for generation and embedding; this stays the local default.
+OLLAMA_BASE_URL: str = OLLAMA_LOCAL_URL
 
 
 # ── Input validation ──────────────────────────────────────────────────────────

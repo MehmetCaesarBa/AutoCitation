@@ -14,6 +14,7 @@ from langchain_community.retrievers import WikipediaRetriever
 
 import Pipeline.ner as ner
 import config
+import backends
 
 # ── Wikipedia client identification ───────────────────────────────────────────
 # The `wikipedia` package (used internally by LangChain's WikipediaRetriever)
@@ -25,10 +26,9 @@ import config
 WIKI_USER_AGENT = "AutoCitation/0.1 (PoC fact-checker; contact: mehmet17b.b@gmail.com)"
 
 # ── Dense / hybrid retrieval scoring ──────────────────────────────────────────
-# The embedding endpoint is the /api/embed sibling of the /api/generate endpoint
-# verifier.py and program.py already call. Built from config.OLLAMA_BASE_URL so a
-# port or host change stays a one-line edit there, as config.py documents.
-OLLAMA_EMBED_URL = f"{config.OLLAMA_BASE_URL}/api/embed"
+# The embedding endpoint (/api/embed) is resolved PER CALL from backends.embed_url(),
+# the sibling of the /api/generate endpoint the generators use, so the Local/RunPod
+# toggle moves embedding along with everything else.
 
 # Reciprocal Rank Fusion constant (Cormack et al. 2009). Fuses by RANK, not
 # score: cosine similarity (~0.3-0.9) and IDF coverage (0-1) live on different
@@ -373,7 +373,7 @@ def _rewrite_query(query: str) -> list[str]:
                     "num_predict": 80},
     }
     try:
-        response = requests.post(f"{config.OLLAMA_BASE_URL}/api/generate",
+        response = requests.post(backends.generate_url(),
                                  json=payload, timeout=180)
         response.raise_for_status()
         raw = response.json()["response"]
@@ -857,7 +857,7 @@ def embed_texts(texts: list[str], *, is_query: bool) -> list[list[float]]:
     """
     prefix = "search_query: " if is_query else "search_document: "
     payload = {"model": config.EMBED_MODEL, "input": [prefix + t for t in texts]}
-    r = requests.post(OLLAMA_EMBED_URL, json=payload, timeout=120)
+    r = requests.post(backends.embed_url(), json=payload, timeout=120)
     r.raise_for_status()
     return r.json()["embeddings"]
 

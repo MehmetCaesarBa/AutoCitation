@@ -154,9 +154,40 @@
 
     .input-actions {
       display: flex;
-      justify-content: flex-end;
+      justify-content: space-between;
+      align-items: center;
       gap: 10px;
+      flex-wrap: wrap;
     }
+
+    .action-buttons { display: flex; gap: 10px; }
+
+    /* ── Backend toggle (Local / RunPod) ───────────────────────────────────── */
+    .backend-toggle {
+      display: inline-flex;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .backend-opt {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      padding: 8px 14px;
+      background: transparent;
+      color: var(--text-dim);
+      border: none;
+      border-radius: 0;
+      cursor: pointer;
+      transition: background var(--transition), color var(--transition);
+    }
+
+    .backend-opt + .backend-opt { border-left: 1px solid var(--border); }
+    .backend-opt.active { background: var(--accent-dim); color: var(--accent); }
+    .backend-opt:not(.active):hover { color: var(--text); }
+    .backend-opt:disabled { opacity: 0.4; cursor: not-allowed; }
 
     /* ── Buttons ────────────────────────────────────────────────────────────── */
     button {
@@ -512,8 +543,14 @@
         spellcheck="false"
       ></textarea>
       <div class="input-actions">
-        <button class="btn-ghost" id="btn-clear">Clear</button>
-        <button class="btn-primary" id="btn-check" disabled>Run check →</button>
+        <div class="backend-toggle" id="backend-toggle" role="group" aria-label="Inference backend">
+          <button type="button" class="backend-opt active" data-backend="local">Local</button>
+          <button type="button" class="backend-opt" data-backend="runpod">RunPod</button>
+        </div>
+        <div class="action-buttons">
+          <button class="btn-ghost" id="btn-clear">Clear</button>
+          <button class="btn-primary" id="btn-check" disabled>Run check →</button>
+        </div>
       </div>
     </section>
 
@@ -591,6 +628,28 @@
     const resultsList    = document.getElementById("results-list");
     const resultsSection = document.getElementById("results-section");
     const perfLabel      = document.getElementById("perf-label");
+    const backendToggle  = document.getElementById("backend-toggle");
+
+    // Which Ollama backend to run on. Persisted per-browser; sent in /check.
+    // localStorage can throw (private mode, blocked storage), so it is guarded.
+    let backend = "local";
+    try { backend = localStorage.getItem("ac_backend") || "local"; } catch (_) {}
+    if (backend !== "local" && backend !== "runpod") backend = "local";
+
+    function paintBackend() {
+      backendToggle.querySelectorAll(".backend-opt").forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.backend === backend);
+      });
+    }
+    paintBackend();
+
+    backendToggle.addEventListener("click", (e) => {
+      const btn = e.target.closest(".backend-opt");
+      if (!btn || btn.disabled) return;
+      backend = btn.dataset.backend;
+      try { localStorage.setItem("ac_backend", backend); } catch (_) {}
+      paintBackend();
+    });
 
     // ── Word count & input validation ─────────────────────────────────────────
     function countWords(text) {
@@ -799,7 +858,7 @@
         const response = await fetch(CHECK_URL, {
           method:  "POST",
           headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify({ text }),
+          body:    JSON.stringify({ text, backend }),
         });
 
         if (!response.ok) {
@@ -837,7 +896,8 @@
         });
 
         show(resultsSection);
-        perfLabel.textContent = `${data.total_claims} claims · ${elapsed}s`;
+        perfLabel.textContent =
+          `${data.total_claims} claims · ${elapsed}s · ${data.backend || backend}`;
 
         // Scroll to results smoothly
         summaryBar.scrollIntoView({ behavior: "smooth", block: "start" });
