@@ -114,10 +114,9 @@ def test_program_carries_the_claim_derived_type_word():
     claim = "The Sahara is the most expansive subtropical arid zone on the planet."
     prog = program.synthesize(claim)
     assert prog is not None and prog.kind == "superlative"
+    # Not 'planet', which the query's last noun would have said: the reason
+    # the type word is read from the claim, not the query.
     assert prog.type_word == "zone"
-    # ...and it disagrees with what the query alone would have said, which is
-    # the whole reason the field exists.
-    assert program._type_word(prog.query) == "planet"
 
 
 # ── 3. The subject query is a fallback, never a pool ──────────────────────────

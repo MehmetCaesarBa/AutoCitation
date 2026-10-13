@@ -361,3 +361,72 @@ def test_wiki_rewrite_provider_returns_more_articles_for_the_chunk_scorer(rewrit
     rewrite.setattr(retriever, "_load_article", lambda t: (f"text {t}", f"url {t}"))
     articles = retriever.fetch_articles("q")
     assert len(articles) == retriever.REWRITE_TOP_ARTICLES
+
+
+# ── Short codes and ordinals (the K2 / Huascarán run) ─────────────────────────
+def test_short_alphanumeric_names_are_scoreable():
+    """'K2' fell under MIN_SCORE_TOKEN_LENGTH, so the query 'K2' scored nothing."""
+    tokens = retriever._tokenize("K2 and F1 are names; 'is' and 10 are not")
+    assert {"k2", "f1"} <= tokens
+    assert "is" not in tokens and "10" not in tokens
+
+
+def test_ordinal_is_never_the_rarest_token():
+    """
+    'second' was rarest, and the coverage guarantee forced in a passage where
+    Huascarán is "a very close second" for a different record.
+    """
+    chunks = [("Everest is the highest peak on Earth.", "u"),
+              ("Huascaran is a very close second.", "u"),
+              ("A list of peaks on Earth.", "u")]
+    assert retriever.rarest_fact_token("second highest peak Earth", chunks) != "second"
+
+
+# ── Table rows as evidence ────────────────────────────────────────────────────
+_TABLE_HTML = """
+<p>Prose the extract already has.</p>
+<table class="wikitable">
+  <tr><th>Rank<sup class="reference">[i]</sup></th><th>Mountain</th>
+      <th>Height</th><th>Range</th><th>Coordinates</th></tr>
+  <tr><td>1</td><td>Mount Everest</td><td>8,849&#160;m</td>
+      <td rowspan="2">Himalaya</td><td>27°59′N</td></tr>
+  <tr><td>2</td><td>Kangchenjunga<span class="sortkey">zzz</span></td><td>8,586 m</td>
+      <td>27°42′N</td></tr>
+  <tr><th colspan="5">Section divider</th></tr>
+  <tr><td>3</td><td>K2</td><td>8,611 m</td><td>Karakoram</td><td>35°52′N</td></tr>
+</table>
+<table class="infobox"><tr><th>Not</th><th>a wikitable</th></tr>
+  <tr><td>x</td><td>y</td></tr></table>
+"""
+
+
+def test_table_rows_become_key_value_sentences():
+    rows = retriever.table_sentences("List of peaks", _TABLE_HTML)
+    assert rows[0] == ("List of peaks - Rank: 1; Mountain: Mount Everest; "
+                       "Height: 8,849 m; Range: Himalaya.")
+    assert len(rows) == 3                    # divider row and infobox skipped
+
+
+def test_rowspan_value_is_repeated_on_the_row_it_spans():
+    """'Himalaya' spans two rows; the second row must carry it too."""
+    rows = retriever.table_sentences("List of peaks", _TABLE_HTML)
+    assert "Mountain: Kangchenjunga; Height: 8,586 m; Range: Himalaya." in rows[1]
+
+
+def test_hidden_text_footnotes_and_coordinates_are_dropped():
+    joined = " ".join(retriever.table_sentences("List of peaks", _TABLE_HTML))
+    assert "zzz" not in joined and "[i]" not in joined and "°" not in joined
+
+
+def test_table_failure_never_fails_the_article(monkeypatch):
+    """A page whose HTML cannot be fetched still loads its prose."""
+    class _Page:
+        content, url, title = "Body text. " * 10, "https://en.wikipedia.org/wiki/X", "X"
+
+        def html(self):
+            raise ConnectionError("rate limited")
+
+    retriever._article_cache.clear()
+    monkeypatch.setattr(retriever.wikipedia, "page", lambda *a, **k: _Page())
+    got = retriever._load_article("X")
+    assert got is not None and got[0].startswith("Body text.")

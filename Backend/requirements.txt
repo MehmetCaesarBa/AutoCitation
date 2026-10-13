@@ -6,6 +6,7 @@ wikipedia
 ddgs                 # DuckDuckGo search when retriever.SEARCH_PROVIDER = "ddgs"
 spacy
 pydantic
+pint>=0.24,<0.25   # unit conversion in Pipeline/program.py; 0.25+ needs a newer Python than the venv's 3.10
 # NLI kind check in Pipeline/program.py. CPU-only torch is enough and far smaller:
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
 torch

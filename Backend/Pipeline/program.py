@@ -17,6 +17,14 @@ the thesis should describe it as such.
                       failure logs, costs no inference, and is unit-testable
                       offline against a fixed parse.
 
+ONE FRAME, NOT TWO CLAIM TYPES. Every program is built from a ComparisonFrame
+(subject, dimension, direction, rank, category, scope, reference), so a
+superlative with an ordinal ("the second-highest") and a comparative that ranks
+("longer than any other river") are both expressible. The frame comes from the
+parse by default; FRAME_PARSER = "llm" has the model fill it through a JSON
+schema — slots, not a program, which is a middle path between the two above.
+See ComparisonFrame and Documents/program_references.md.
+
 WHY A PROGRAM AT ALL. The single-shot verifier is asked "does this evidence
 support this claim?" — one question, one answer. For two claim types that
 question is the wrong one, and no prompt wording repairs it:
@@ -51,11 +59,17 @@ which keeps its failure mode "no help" instead of "new wrong answers".
 """
 
 import functools
+import json
 import re
 from dataclasses import dataclass, field
 
+import pint
+import requests
+from spacy.lang.en.stop_words import STOP_WORDS
+
 import Pipeline.ner as ner
 import Pipeline.retriever as retriever
+import Pipeline.wikidata as wikidata
 from models import llm
 from Pipeline.results import VerificationResult
 
@@ -99,8 +113,32 @@ NLI_MODEL = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
 # Minimum P(entailment) for an evidence window to count as stating the
 # hypothesis. Below it, the answer is rejected and the claim goes to NOT ENOUGH
 # INFO — the safe direction for this module's failure mode.
-ENTAILMENT_THRESHOLD = 0.5
+#
+# WAS 0.5, WHICH ACCEPTED A DIFFERENT RECORD. Live: "Huascarán is the
+# second-highest peak on Earth" passed at p=0.74 from a window about the
+# FARTHEST POINT FROM EARTH'S CENTER ("...with Huascarán in Peru a very close
+# second"). Measured on this model:
+#
+#     true statements of the record   0.977 - 0.987   (Everest, K2's own lead,
+#                                                      Saint Augustine, the blue
+#                                                      whale by synonym, the Nile)
+#     false or off-record windows     0.001 - 0.739   (Huascarán 0.739, Mauna Kea
+#                                                      0.327, Ponce de León 0.080)
+#
+# 0.9 sits in the gap with margin on both sides. A dimension-keyword test on the
+# window was considered and rejected: the Huascarán window contains 'higher',
+# so it would have passed that test too.
+ENTAILMENT_THRESHOLD = 0.9
 
+
+# How the comparison frame is built. "rules" reads it off the spaCy parse —
+# deterministic, offline, and the baseline the tests pin. "llm" asks
+# ANSWER_MODEL to fill the frame through Ollama's JSON-schema output, validates
+# every slot against the claim, and falls back to the rules when the reply is
+# unusable. Its value is phrasings no rule anticipates ("one of the two
+# highest", "outranks every other"); its cost is one extra call per claim, which
+# should be measured before it becomes the default.
+FRAME_PARSER = "rules"
 
 # ── Operator detection ────────────────────────────────────────────────────────
 # Comparative markers. JJR/RBR are the comparative tags ('taller', 'longer',
@@ -109,24 +147,59 @@ ENTAILMENT_THRESHOLD = 0.5
 # a 'than' with a nominal object to compare AGAINST.
 _COMPARATIVE_TAGS = {"JJR", "RBR"}
 
-# Dimension lexicon: which quantity a comparative adjective is about, and the
-# family of units that expresses it. Without this, "taller" and "longer" are
-# indistinguishable strings and the extractor cannot tell which of an article's
-# many numbers is the relevant one.
+
+@dataclass(frozen=True)
+class Dimension:
+    """
+    A measurable quantity: what it is called, which unit family expresses it,
+    and the words a sentence must contain for its numbers to be about it.
+
+    `family` is a pint dimensionality ('length', 'area', 'mass') or 'count' for
+    unit-less tallies such as population, which pint has nothing to say about.
+    """
+    name: str
+    family: str
+    keywords: tuple[str, ...]
+
+
+_DIMENSION_SPECS = {
+    "height":     Dimension("height", "length", ("height", "tall", "high", "elevation", "altitude")),
+    "elevation":  Dimension("elevation", "length", ("elevation", "height", "altitude", "high")),
+    "altitude":   Dimension("altitude", "length", ("altitude", "elevation", "height", "high")),
+    "length":     Dimension("length", "length", ("length", "long")),
+    "depth":      Dimension("depth", "length", ("depth", "deep")),
+    "width":      Dimension("width", "length", ("width", "wide")),
+    "area":       Dimension("area", "area", ("area",)),
+    "weight":     Dimension("weight", "mass", ("weight", "weigh", "heavy", "mass")),
+    "population": Dimension("population", "count", ("population", "populous", "inhabitants")),
+}
+
+# Dimension lexicon: which quantity an ADJECTIVE is about, and which way it
+# points. 'max' — larger value wins ('taller', 'deepest'); 'min' — smaller
+# value wins ('lower', 'shallowest').
 #
 # Deliberately small. Each entry is a claim about what a word measures, and a
 # wrong entry produces a confident comparison of unrelated quantities — far
-# worse than declining. Ambiguous adjectives ('larger', 'bigger', 'greater')
-# are EXCLUDED for exactly that reason: larger by area, population, or volume
-# is not decidable from the adjective.
+# worse than declining. Ambiguous adjectives are EXCLUDED for exactly that
+# reason: 'larger', 'bigger', 'greater' (by area, population or volume?),
+# 'shorter' (height or length?), 'lighter' (mass or colour?).
+#
+# 'old' WAS HERE, mapped to a 'year' family that no extractor ever read — so
+# every "older than" claim silently went to NOT ENOUGH INFO. It stays out:
+# age needs a reference event (founded, built, born, formed) that differs by
+# category, and the year nearest a keyword is as often a renovation as a
+# founding.
 _DIMENSIONS = {
-    "tall":     ("height", "length"),
-    "high":     ("height", "length"),
-    "long":     ("length", "length"),
-    "deep":     ("depth", "length"),
-    "wide":     ("width", "length"),
-    "populous": ("population", "count"),
-    "old":      ("age", "year"),
+    "tall":     ("height", "max"),
+    "high":     ("height", "max"),
+    "low":      ("height", "min"),
+    "long":     ("length", "max"),
+    "deep":     ("depth", "max"),
+    "shallow":  ("depth", "min"),
+    "wide":     ("width", "max"),
+    "narrow":   ("width", "min"),
+    "heavy":    ("weight", "max"),
+    "populous": ("population", "max"),
 }
 
 # _NOUN_DIMENSIONS: dimension keyed by the NOUN a generic comparative modifies.
@@ -137,39 +210,97 @@ _DIMENSIONS = {
 # RATE": there "higher" is a bare magnitude word and the dimension is the noun.
 # Reading the adjective in that case mapped every "higher X" to 'high' -> height
 # and produced, live, a fatality-rate claim "refuted" by comparing mountain
-# heights. See _comparative_program for which parse shape selects which table.
+# heights. See _dimension_of for which parse shape selects which table.
 #
-# Only nouns whose unit family the Quantity handler can actually read are listed
-# (length / count / year). A noun that is not here — velocity, rate, mass, area,
-# temperature — resolves to None and the claim declines to the verifier rather
-# than inventing a comparison in the wrong units.
+# Only nouns whose unit family the Quantity handler can actually read are listed.
+# A noun that is not here — velocity, rate, temperature — resolves to None and
+# the claim declines to the verifier rather than inventing a comparison in the
+# wrong units.
 _NOUN_DIMENSIONS = {
-    "height":     ("height", "length"),
-    "elevation":  ("elevation", "length"),
-    "altitude":   ("altitude", "length"),
-    "length":     ("length", "length"),
-    "depth":      ("depth", "length"),
-    "width":      ("width", "length"),
-    "population": ("population", "count"),
-    "age":        ("age", "year"),
+    "height": "height", "elevation": "elevation", "altitude": "altitude",
+    "length": "length", "depth": "depth", "width": "width", "area": "area",
+    "weight": "weight", "mass": "weight", "population": "population",
 }
 
-# Unit conversion to a canonical base. Length -> metres, count -> units,
-# year -> year. Only units that actually appear in encyclopedia prose.
-_UNIT_TO_BASE = {
-    # length family -> metres
-    "mm": 0.001, "cm": 0.01, "m": 1.0, "metre": 1.0, "metres": 1.0,
-    "meter": 1.0, "meters": 1.0, "km": 1000.0, "kilometre": 1000.0,
-    "kilometres": 1000.0, "kilometer": 1000.0, "kilometers": 1000.0,
-    "ft": 0.3048, "foot": 0.3048, "feet": 0.3048,
-    "mi": 1609.344, "mile": 1609.344, "miles": 1609.344,
-    "yd": 0.9144, "yard": 0.9144, "yards": 0.9144,
+# Markers whose direction is 'min' whatever they modify: "LESS populous",
+# "the LEAST deep".
+_DIMINISHING = {"less", "least", "little", "few", "fewer", "fewest"}
+
+# Comparative -> superlative, for "longer than any other river", which is a
+# superlative claim written as a comparison and needs a superlative question.
+_IRREGULAR_SUPERLATIVE = {
+    "better": "best", "worse": "worst", "more": "most", "less": "least",
+    "farther": "farthest", "further": "furthest",
 }
 
-_UNIT_FAMILY = {u: "length" for u in _UNIT_TO_BASE}
+# Quantifiers that make a 'than' object a whole category, not an entity:
+# "than ANY other river", "than ALL other rivers", "than EVERY other river".
+_UNIVERSAL_DETERMINERS = {"any", "all", "every", "each"}
+
+_ORDINAL_TEXT = {2: "second", 3: "third", 4: "fourth", 5: "fifth", 6: "sixth",
+                 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth"}
 
 
 # ── Program representation ────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class ComparisonFrame:
+    """
+    One typed reading of a claim that compares or ranks — the form every
+    program is built from.
+
+    WHY ONE FRAME AND NOT TWO CLAIM TYPES. The module used to sort claims into
+    'superlative' or 'comparative' and give each its own path. Real claims do
+    not respect that split:
+
+        "K2 is the second-highest peak on Earth"             a superlative with a RANK
+        "The Nile is longer than any other river in Africa"  a comparative that is
+                                                             really a superlative
+
+    The first was asked "what is the highest peak?"; the second was compared
+    against an entity called 'river in Africa'. Both are one operation — order
+    a set by a quantity, then check a position or a pair — which is how
+    semantic parsing has represented them: lambda DCS's argmax with a rank
+    argument (Liang 2013), TabFact's argmax/argmin program functions (Chen et
+    al. 2020), KQA Pro's KoPL comparison operators (Cao et al. 2022). See
+    Documents/program_references.md.
+
+    rank       1.. for a ranking claim ("the second-highest" -> 2); None for a
+               pairwise comparison against `reference`.
+    marker     the superlative as a question would use it, ordinal included:
+               'second highest', 'most populous', 'longest'.
+    dimension  key into _DIMENSION_SPECS, or None when the marker names no
+               quantity this module can read ('earliest', 'largest').
+    direction  'max' when the larger value wins, 'min' when the smaller does.
+    category   what is ranked ('peak', 'settlement'); scope is where ('Africa').
+    query      the category question a ranking claim retrieves with.
+    """
+    subject: str
+    marker: str
+    dimension: str | None
+    direction: str
+    rank: int | None
+    category: str | None = None
+    scope: str | None = None
+    reference: str | None = None
+    query: str = ""
+    type_word: str = ""
+    source: str = "rules"
+    # True when nothing but the marker narrows the category — see
+    # _scope_and_bare. Defaults False: unknown means "may be narrowed".
+    bare: bool = False
+
+    @property
+    def world_scope(self) -> bool:
+        """Is the ranking over the whole class, not a place within it?"""
+        return self.scope is None or self.scope.lower() in _WORLD_SCOPES
+
+    @property
+    def kind(self) -> str:
+        # The two names the rest of the pipeline (results.program_kind, the
+        # frontend) already knows. 'superlative' now covers every ranking claim.
+        return "superlative" if self.rank is not None else "comparative"
+
+
 @dataclass(frozen=True)
 class Step:
     """One instruction. `op` names the handler, `args` are its inputs."""
@@ -181,7 +312,12 @@ class Step:
 @dataclass
 class Program:
     """
-    A synthesised reasoning program plus the bindings produced by executing it.
+    A synthesised reasoning program: the frame it was built from, the steps it
+    shows, and what executing it produced.
+
+    The FRAME drives execution; `steps` is the plan as printed before running.
+    kind, query and type_word are read from the frame rather than stored beside
+    it, so the two can never disagree.
 
     `trace` is not decoration. ProgramFC's stated advantage over end-to-end
     verification is that the reasoning is inspectable and debuggable, and a
@@ -189,18 +325,25 @@ class Program:
     becomes part of the rationale shown to the user, so a verdict can be argued
     with rather than merely accepted.
     """
-    kind: str
+    frame: ComparisonFrame
     steps: list[Step]
-    bindings: dict = field(default_factory=dict)
     trace: list[str] = field(default_factory=list)
     chunks: list[str] = field(default_factory=list)
     source_url: str = ""
-    query: str = ""
-    # The category the superlative ranks within, read from the CLAIM's parse at
-    # synthesis time. Carried on the program because execute() has the claim and
-    # _handle_question does not — see ner.superlative_type_word for why deriving
-    # it from `query` instead is unreliable.
-    type_word: str = ""
+
+    @property
+    def kind(self) -> str:
+        return self.frame.kind
+
+    @property
+    def query(self) -> str:
+        return self.frame.query
+
+    @property
+    def type_word(self) -> str:
+        # The category the superlative ranks within, read from the CLAIM's
+        # parse — see ner.superlative_type_word for why the query cannot say.
+        return self.frame.type_word
 
 
 @dataclass(frozen=True)
@@ -222,8 +365,33 @@ class ProgramOutcome:
 # ── Synthesis ─────────────────────────────────────────────────────────────────
 def synthesize(claim: str) -> Program | None:
     """
-    Build a program for `claim`, or None when no operator is recognised.
+    Build a program for `claim`, or None when the claim neither ranks nor compares.
+    """
+    frame = build_frame(claim)
+    if frame is None:
+        return None
+    return _program_for(frame)
 
+
+def build_frame(claim: str) -> ComparisonFrame | None:
+    """
+    The claim's comparison frame, from the model when FRAME_PARSER says so and
+    its reply validates, otherwise from the parse.
+
+    The rules always remain the fallback. A model reply that fails validation,
+    times out, or says "no comparison" where the parse found one never
+    withdraws a program the rules would have built.
+    """
+    rules = _frame_from_rules(claim)
+    if FRAME_PARSER == "llm":
+        frame = _frame_from_llm(claim, rules)
+        if frame is not None:
+            return frame
+    return rules
+
+
+def _frame_from_rules(claim: str) -> ComparisonFrame | None:
+    """
     Superlative is tested BEFORE comparative. "The Amazon is the longest river"
     contains 'longest' (JJS) and would also satisfy a loose comparative test;
     the superlative reading is the correct one, and running the comparative
@@ -233,13 +401,15 @@ def synthesize(claim: str) -> Program | None:
 
     superlative = _find_superlative(doc)
     if superlative is not None:
-        return _superlative_program(claim, doc, superlative)
+        return _ranking_frame(claim, superlative)
 
     comparative = _find_comparative(doc)
-    if comparative is not None:
-        return _comparative_program(claim, doc, *comparative)
-
-    return None
+    if comparative is None:
+        return None
+    comp, obj, other = comparative
+    if obj is not None and _is_universal(obj):
+        return _universal_frame(claim, comp, obj)
+    return _pairwise_frame(claim, comp, other)
 
 
 def _find_superlative(doc):
@@ -262,12 +432,15 @@ def _find_superlative(doc):
 
 def _find_comparative(doc):
     """
-    (comparative_token, compared_entity) — or None.
+    (comparative_token, than_object_token | None, compared_text) — or None.
 
     Requires BOTH a comparative tag and a 'than' phrase with a nominal object.
     "longer than the Nile" qualifies; "the river is longer now" does not, and
     treating it as a comparison would send the extractor looking for a second
     entity the claim never names.
+
+    The object TOKEN is returned beside its text so the caller can see its
+    determiners: "than ANY other river" names a category, not an entity.
     """
     comp = next((t for t in doc if t.tag_ in _COMPARATIVE_TAGS), None)
     if comp is None:
@@ -294,13 +467,13 @@ def _find_comparative(doc):
     if pobj is not None:
         span = _noun_span(pobj)
         if span:
-            return comp, span
+            return comp, pobj, span
 
     for token in doc:
         if token.i > than.i and token.pos_ in ("PROPN", "NOUN"):
             span = _noun_span(token)
             if span:
-                return comp, span
+                return comp, token, span
     return None
 
 
@@ -317,7 +490,164 @@ def _noun_span(token) -> str:
     return re.sub(r'^(the|a|an)\s+', '', text, flags=re.I).strip()
 
 
-def _superlative_program(claim: str, doc, superlative) -> Program | None:
+def _is_universal(obj) -> bool:
+    """
+    Does the 'than' object quantify over a whole category?
+
+        "longer than ANY other river"   -> True   (a superlative in disguise)
+        "longer than the Nile"          -> False  (a second entity)
+
+    Read off the determiner, and only on a COMMON noun: "than all" with nothing
+    after it ranks against nothing nameable.
+    """
+    return obj.pos_ == "NOUN" and any(
+        c.dep_ in ("det", "predet") and c.lower_ in _UNIVERSAL_DETERMINERS
+        for c in obj.children
+    )
+
+
+def _dimension_of(marker) -> tuple[str, str] | None:
+    """
+    (dimension_key, direction) for a comparative or superlative token, or None.
+
+    THE DIMENSION COMES FROM THE PARSE SHAPE, NOT ALWAYS THE ADJECTIVE. spaCy's
+    dependency label on the marker says where the dimension lives:
+
+      advmod "MORE populous / LEAST deep"   -> the adjective it modifies names it
+      amod   "higher VELOCITY / RATE"       -> the NOUN it modifies names it
+      amod   "is the highest PEAK"          -> the adjective — see below
+      acomp  "X is TALLER / LONGER"         -> the adjective IS the dimension
+
+    Reading `marker.lemma_` unconditionally was correct only for the last case;
+    for "higher velocity" it mapped 'high' -> height and compared the wrong
+    quantity.
+
+    THE COPULAR EXCEPTION. In "Everest is the highest PEAK" the noun is what the
+    subject IS — a category, not an attribute — so it cannot name a dimension
+    and the adjective does. In "K2 has the highest fatality RATE" the noun is
+    the object of 'has', an attribute of the subject, and the claim declines.
+    The dependency that separates them is `attr`: the complement of a copula.
+
+    DIRECTION. 'less' / 'least' reverse whatever they modify: "LESS populous"
+    is a population claim where the smaller value wins. Before this, "India is
+    less populous than China" was compared as if it said MORE populous.
+    """
+    diminishing = marker.lemma_.lower() in _DIMINISHING
+
+    def flip(direction: str) -> str:
+        return {"max": "min", "min": "max"}[direction] if diminishing else direction
+
+    if marker.dep_ == "advmod" and marker.head.pos_ in ("ADJ", "ADV"):
+        entry = _DIMENSIONS.get(marker.head.lemma_.lower())
+        return (entry[0], flip(entry[1])) if entry else None
+
+    entry = _DIMENSIONS.get(marker.lemma_.lower())
+    if marker.dep_ == "amod" and marker.head.pos_ == "NOUN":
+        noun = marker.head
+        key = _NOUN_DIMENSIONS.get(noun.lemma_.lower())
+        if key is not None:
+            # "higher ELEVATION", "lower POPULATION": the noun is the quantity
+            # and the adjective only says which way. A magnitude word outside
+            # the adjective table ('greater', 'larger') points up.
+            if diminishing:
+                return key, "min"
+            return key, entry[1] if entry else "max"
+        if noun.dep_ == "attr" and entry is not None:
+            return entry
+        return None
+
+    return entry
+
+
+def _superlative_form(comp) -> str:
+    """'longer' -> 'longest', 'more populous' -> 'most populous'."""
+    if comp.dep_ == "advmod" and comp.head.pos_ in ("ADJ", "ADV"):
+        word = _IRREGULAR_SUPERLATIVE.get(comp.lower_, comp.lower_)
+        return f"{word} {comp.head.lower_}"
+    word = comp.lower_
+    if word in _IRREGULAR_SUPERLATIVE:
+        return _IRREGULAR_SUPERLATIVE[word]
+    # 'longer' -> 'longest', 'bigger' -> 'biggest', 'heavier' -> 'heaviest'.
+    return word[:-2] + "est" if word.endswith("er") else word
+
+
+def _by_dimension(superlative) -> tuple[str, str] | None:
+    """
+    "the largest country BY AREA" — an ambiguous adjective whose dimension the
+    claim states outright, in a 'by' phrase on the ranked noun. Without this,
+    'largest' declines for being ambiguous even when the claim has resolved it.
+    """
+    noun = superlative
+    while noun.pos_ != "NOUN" and noun.head is not noun:
+        noun = noun.head
+    for prep in noun.children:
+        if prep.dep_ == "prep" and prep.lower_ == "by":
+            for pobj in prep.children:
+                key = _NOUN_DIMENSIONS.get(pobj.lemma_.lower())
+                if pobj.dep_ == "pobj" and key is not None:
+                    smaller = superlative.lemma_.lower() in _DIMINISHING | {"small"}
+                    return key, "min" if smaller else "max"
+    return None
+
+
+# Prepositions that place a category somewhere: 'the highest mountain IN the
+# world', 'the longest river IN Africa', 'the second-highest peak ON Earth'.
+_SCOPE_PREPS = {"in", "on", "of", "within", "across", "throughout"}
+
+# Scopes that restrict nothing. "The highest mountain on Earth" and "the
+# highest mountain" rank the same set.
+_WORLD_SCOPES = {"world", "earth", "planet", "globe"}
+
+
+def _category_token(marker):
+    """The noun a superlative or comparative ranks: walk up to the first NOUN."""
+    node = marker
+    while node.pos_ != "NOUN" and node.head is not node:
+        node = node.head
+    return node if node.pos_ == "NOUN" else None
+
+
+def _scope_and_bare(noun, marker_ids: set[int]) -> tuple[str | None, bool, bool]:
+    """
+    (scope, bare, unread_by) for the ranked noun.
+
+    scope      the place the ranking is within ('Africa'), or None.
+    bare       True when nothing but the marker narrows the category. "the
+               highest UNCLIMBED mountain", "the earliest EUROPEAN PERMANENT
+               settlement", "the tallest mountain CLIMBED WITHOUT OXYGEN" rank
+               a subset, and a rival from the whole class does not refute them
+               — so whatever compares the subject against arbitrary members of
+               the class (the Wikidata route) must know.
+    unread_by  the claim names its own dimension in a 'by' phrase this module
+               cannot read ('highest mountain BY PROMINENCE'). The adjective's
+               dimension must then not be used: 'highest' would say elevation.
+
+    'above sea level' is allowed: it says which height, the one Wikidata and
+    every list of mountains already use.
+    """
+    scope, bare, unread_by = None, True, False
+    for child in noun.children:
+        if child.i in marker_ids or child.dep_ in ("det", "predet", "punct"):
+            continue
+        if child.dep_ == "prep":
+            pobj = next((g for g in child.children if g.dep_ == "pobj"), None)
+            if pobj is None:
+                bare = False
+            elif child.lower_ in _SCOPE_PREPS and scope is None:
+                scope = _noun_span(pobj) or None
+            elif child.lower_ in ("above", "below") and pobj.lemma_.lower() == "level":
+                pass
+            elif child.lower_ == "by" and pobj.lemma_.lower() in _NOUN_DIMENSIONS:
+                pass
+            else:
+                bare = False
+                unread_by = unread_by or child.lower_ == "by"
+            continue
+        bare = False                 # amod, compound, acl, relcl, nummod, poss ...
+    return scope, bare, unread_by
+
+
+def _ranking_frame(claim: str, superlative) -> ComparisonFrame | None:
     """
     answer_1 = Question(<category query>)
     label    = Match(answer_1, subject)
@@ -326,31 +656,91 @@ def _superlative_program(claim: str, doc, superlative) -> Program | None:
     superlative ranks within, not the claim's subject. Asking "what was the
     earliest European settlement in the US?" reaches Saint Augustine; asking
     about Jamestown never can.
+
+    The rank travels inside the query ('second highest peak Earth'), so the
+    Question step asks the claim's own question rather than "who is first?".
     """
     subject = ner.extract_subject(claim)
-    category = ner.build_predicate_query(claim)
+    query = ner.build_predicate_query(claim)
 
     # Both are required. Without a subject there is nothing to compare the
     # answer against; without a category query the retrieval would fall back to
     # the subject and reproduce the failure this exists to fix.
-    if not subject or not category:
+    if not subject or not query:
         return None
 
-    return Program(
-        kind="superlative",
-        steps=[
-            Step("answer_1", "Question", (category,)),
-            Step("label", "Match", ("answer_1", subject)),
-        ],
-        query=category,
-        # Read from `claim`, not from `category`. The category query has had its
-        # prepositions stripped, which is exactly the information needed to tell
-        # the ranked type from the scope it is ranked within.
-        type_word=ner.superlative_type_word(claim) or "",
+    rank, ordinal = ner.superlative_rank(superlative)
+    words = [ordinal.lower_] if ordinal is not None else []
+    if superlative.tag_ == "RBS" and superlative.head.pos_ in ("ADJ", "ADV"):
+        words += [superlative.lower_, superlative.head.lower_]
+    else:
+        words.append(superlative.lower_)
+
+    # Read from `claim`, not from `query`. The category query has had its
+    # prepositions stripped, which is exactly the information needed to tell
+    # the ranked type from the scope it is ranked within.
+    type_word = ner.superlative_type_word(claim) or ""
+
+    marker_ids = {superlative.i} | ({ordinal.i} if ordinal is not None else set())
+    if superlative.tag_ == "RBS":
+        marker_ids.add(superlative.head.i)          # 'most POPULOUS'
+    noun = _category_token(superlative)
+    scope, bare, unread_by = (_scope_and_bare(noun, marker_ids) if noun is not None
+                              else (None, False, False))
+
+    dimension = None if unread_by else (_dimension_of(superlative)
+                                        or _by_dimension(superlative))
+    return ComparisonFrame(
+        subject=subject,
+        marker=" ".join(words),
+        dimension=dimension[0] if dimension else None,
+        direction=dimension[1] if dimension else "max",
+        rank=rank,
+        category=type_word or None,
+        scope=scope,
+        bare=bare,
+        query=query,
+        type_word=type_word,
     )
 
 
-def _comparative_program(claim: str, doc, comp, other: str) -> Program | None:
+def _universal_frame(claim: str, comp, obj) -> ComparisonFrame | None:
+    """
+    "The Nile is longer than any other river in Africa" — rank 1, category
+    'river', scope 'Africa'. Treated exactly like "the longest river in Africa",
+    which is what it asserts. Compared pairwise, as it used to be, the second
+    entity was 'river in Africa' and Quantity() went looking for its length.
+    """
+    subject = ner.extract_subject(claim)
+    if not subject:
+        return None
+
+    modifiers = [t.text for t in obj.children
+                 if t.dep_ in ("amod", "compound") and t.lower_ != "other"]
+    category = " ".join(modifiers + [obj.lemma_.lower()])
+    # 'other' and the universal determiner are the comparison's own machinery,
+    # not narrowings of the category.
+    scope, bare, _ = _scope_and_bare(obj, {t.i for t in obj.children
+                                           if t.lower_ == "other"})
+    marker = _superlative_form(comp)
+    query = ner._sanitize_query(" ".join(w for w in (marker, category, scope) if w))
+
+    dimension = _dimension_of(comp)
+    return ComparisonFrame(
+        subject=subject,
+        marker=marker,
+        dimension=dimension[0] if dimension else None,
+        direction=dimension[1] if dimension else "max",
+        rank=1,
+        category=category,
+        scope=scope,
+        bare=bare,
+        query=query,
+        type_word=obj.lemma_.lower(),
+    )
+
+
+def _pairwise_frame(claim: str, comp, other: str) -> ComparisonFrame | None:
     """
     q_1   = Quantity(subject, dimension)
     q_2   = Quantity(other,   dimension)
@@ -365,46 +755,179 @@ def _comparative_program(claim: str, doc, comp, other: str) -> Program | None:
     if not subject:
         return None
 
-    # THE DIMENSION COMES FROM THE PARSE SHAPE, NOT ALWAYS THE ADJECTIVE.
-    #
-    # spaCy's dependency label on the comparative says where the dimension lives:
-    #
-    #   acomp  "X is TALLER / LONGER"    -> the adjective IS the dimension
-    #   amod   "higher VELOCITY / RATE"  -> the NOUN it modifies is the dimension
-    #   advmod "MORE populous / LESS deep" -> the adjective it modifies is it
-    #
-    # Reading `comp.lemma_` unconditionally (the old behaviour) was correct only
-    # for the first case; for "higher velocity" it mapped 'high' -> height and
-    # compared the wrong quantity. Each shape now reads from the right token.
-    if comp.dep_ == "amod" and comp.head.pos_ == "NOUN":
-        dimension = _NOUN_DIMENSIONS.get(comp.head.lemma_.lower())
-    elif comp.dep_ == "advmod" and comp.head.pos_ in ("ADJ", "ADV"):
-        dimension = _DIMENSIONS.get(comp.head.lemma_.lower())
-    else:
-        dimension = _DIMENSIONS.get(comp.lemma_.lower())
-
+    dimension = _dimension_of(comp)
     if dimension is None:
         # No measurable dimension this program can read (an ambiguous adjective
-        # like 'larger', or a noun like velocity/rate/mass it has no units for).
+        # like 'larger', or a noun like velocity/rate it has no units for).
         # Decline rather than compare whatever numbers happen to be nearby — the
         # claim falls through to the verifier.
         return None
 
-    name, family = dimension
-    return Program(
-        kind="comparative",
-        steps=[
-            Step("q_1", "Quantity", (subject, name, family)),
-            Step("q_2", "Quantity", (other, name, family)),
-            Step("label", "Compare", ("q_1", "q_2")),
-        ],
+    return ComparisonFrame(
+        subject=subject,
+        marker=comp.lower_,
+        dimension=dimension[0],
+        direction=dimension[1],
+        rank=None,
+        reference=other,
         query=f"{subject} {other}",
+    )
+
+
+# ── Frame from the model (FRAME_PARSER = "llm") ───────────────────────────────
+# The model fills SLOTS, it does not write a program. ProgramFC's generated
+# programs need a parser and a fallback for malformed output; a JSON schema
+# enforced by Ollama's constrained decoding removes the malformed case, and the
+# validation in _frame_from_llm removes the hallucinated one: every name the
+# model returns must be a span of the claim.
+_FRAME_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "comparison":  {"type": "string", "enum": ["none", "pairwise", "ranking"]},
+        "subject":     {"type": "string"},
+        "reference":   {"type": "string"},
+        "superlative": {"type": "string"},
+        "dimension":   {"type": "string", "enum": [*_DIMENSION_SPECS, "none"]},
+        "direction":   {"type": "string", "enum": ["max", "min"]},
+        "rank":        {"type": "integer", "minimum": 1, "maximum": 10},
+        "category":    {"type": "string"},
+        "scope":       {"type": "string"},
+    },
+    "required": ["comparison", "subject", "reference", "superlative",
+                 "dimension", "direction", "rank", "category", "scope"],
+}
+
+_FRAME_PROMPT = """Classify how this claim compares or ranks things. Reply with JSON only.
+
+comparison: "pairwise" if it compares the subject with ONE named entity,
+  "ranking" if it places the subject at a position within a whole category
+  (superlatives, "second-largest", "than any other"), otherwise "none".
+subject: the entity the claim is about, copied exactly from the claim.
+reference: pairwise only - the other entity, copied exactly. Otherwise "".
+superlative: ranking only - the superlative word(s) WITHOUT the ordinal
+  ("highest", "most populous"). For "longer than any other", write "longest".
+dimension: the measured quantity, one of: {dimensions}; "none" if it is not
+  one of these or is ambiguous ("larger" could be area or population).
+direction: "max" if the larger value wins (taller, deepest), "min" if the
+  smaller one does (lower, least populous).
+rank: 1 for a plain superlative, 2 for "second-...", and so on. 1 for pairwise.
+category: ranking only - what is ranked ("peak", "European settlement").
+scope: ranking only - where it is ranked ("Earth", "Africa"), or "".
+
+Examples:
+"Mount Everest is taller than K2." ->
+{{"comparison":"pairwise","subject":"Mount Everest","reference":"K2","superlative":"","dimension":"height","direction":"max","rank":1,"category":"","scope":""}}
+"K2 is the second-highest peak on Earth." ->
+{{"comparison":"ranking","subject":"K2","reference":"","superlative":"highest","dimension":"height","direction":"max","rank":2,"category":"peak","scope":"Earth"}}
+"Paris hosted the 2024 Olympics." ->
+{{"comparison":"none","subject":"Paris","reference":"","superlative":"","dimension":"none","direction":"max","rank":1,"category":"","scope":""}}
+
+Claim: "{claim}" ->"""
+
+
+def _frame_from_llm(claim: str,
+                    rules: ComparisonFrame | None) -> ComparisonFrame | None:
+    """
+    The model's frame, or None when it is unusable — in which case build_frame
+    keeps the rules' frame.
+
+    VALIDATION, SLOT BY SLOT. subject, reference and category must occur in the
+    claim (no names from the model's own knowledge); a pairwise frame needs a
+    measurable dimension, exactly as _pairwise_frame does; and where the parse
+    found an ordinal, the model's rank must agree with it — the parse is right
+    about which word is there even when it is wrong about what it means.
+    """
+    try:
+        raw = llm.generate(
+            ANSWER_MODEL,
+            _FRAME_PROMPT.format(claim=claim, dimensions=", ".join(_DIMENSION_SPECS)),
+            think=False,
+            keep_alive=KEEP_ALIVE,
+            format=_FRAME_SCHEMA,
+            options={"num_ctx": 4096, "num_predict": 160, "temperature": 0,
+                     "top_p": 1, "top_k": 1, "seed": 0},
+        ).text
+        data = json.loads(raw)
+    except (requests.RequestException, json.JSONDecodeError) as e:
+        print(f"[Program] Frame model unavailable ({type(e).__name__}) — using the parse.")
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    low = claim.lower()
+
+    def span(key: str) -> str:
+        value = str(data.get(key) or "").strip()
+        return value if value and value.lower() in low else ""
+
+    kind = data.get("comparison")
+    subject = span("subject")
+    if kind not in ("pairwise", "ranking") or not subject:
+        return None
+
+    dimension = data.get("dimension")
+    dimension = dimension if dimension in _DIMENSION_SPECS else None
+    direction = data.get("direction") if data.get("direction") in ("max", "min") else "max"
+
+    if kind == "pairwise":
+        reference = span("reference")
+        if not reference or dimension is None:
+            return None
+        return ComparisonFrame(subject=subject, marker="", dimension=dimension,
+                               direction=direction, rank=None, reference=reference,
+                               query=f"{subject} {reference}", source="llm")
+
+    rank = data.get("rank")
+    category = span("category")
+    superlative = str(data.get("superlative") or "").strip().lower()
+    if not isinstance(rank, int) or not 1 <= rank <= 10 or not category or not superlative:
+        return None
+    if rules is not None and rules.rank is not None and rules.rank != rank:
+        print(f"[Program] Frame model said rank {rank}, the parse says "
+              f"{rules.rank} — using the parse.")
+        return None
+
+    scope = span("scope") or None
+    marker = " ".join(w for w in (_ORDINAL_TEXT.get(rank), superlative) if w)
+    query = ner._sanitize_query(" ".join(w for w in (marker, category, scope) if w))
+    return ComparisonFrame(
+        subject=subject, marker=marker, dimension=dimension, direction=direction,
+        rank=rank, category=category, scope=scope, query=query,
+        type_word=category.split()[-1].lower(), source="llm",
+        # A one-word category carries no narrowing modifier.
+        bare=len(category.split()) == 1,
+    )
+
+
+def _program_for(frame: ComparisonFrame) -> Program:
+    """The steps a frame executes. The steps are what is shown; the frame drives."""
+    if frame.rank is not None:
+        steps = [
+            Step("answer_1", "Question", (frame.query,)),
+            Step("label", "Match", ("answer_1", frame.subject)),
+        ]
+        if frame.dimension is not None and frame.rank == 1:
+            # Consulted only when Match refutes — see _numeric_corroborate.
+            spec = _DIMENSION_SPECS[frame.dimension]
+            steps.append(Step("check", "Compare",
+                              ("answer_1", frame.subject, spec.name, frame.direction)))
+        return Program(frame=frame, steps=steps)
+
+    spec = _DIMENSION_SPECS[frame.dimension]
+    return Program(
+        frame=frame,
+        steps=[
+            Step("q_1", "Quantity", (frame.subject, spec.name, spec.family)),
+            Step("q_2", "Quantity", (frame.reference, spec.name, spec.family)),
+            Step("label", "Compare", ("q_1", "q_2", frame.direction)),
+        ],
     )
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 def _retrieve(query: str, top_k: int,
-              rank_against: str | None = None) -> tuple[list[str], str]:
+              rank_against: str | None = None,
+              rank: int | None = None) -> tuple[list[str], str]:
     """
     Chunks for a free-text query, ranked by retriever.rank_chunks — the same
     scorer and selection the verifier path uses.
@@ -416,6 +939,9 @@ def _retrieve(query: str, top_k: int,
     fetches the right article but ranks its chunks near-uniformly — the subject
     appears in most of them, so it discriminates nothing. The chunk that answers
     is the one matching the CATEGORY, so fetch by subject and rank by category.
+
+    `rank`, for a ranking claim, adds the table rows at that rank ahead of the
+    ranked chunks — see _ranked_rows.
     """
     articles = retriever.fetch_articles(query)
     if not articles:
@@ -423,7 +949,57 @@ def _retrieve(query: str, top_k: int,
     chunks = retriever.chunk_articles(articles)
     # Ranked exactly as the verifier path ranks its evidence — see
     # retriever.rank_chunks for why this must never be a separate scorer again.
-    return retriever.rank_chunks(rank_against or query, chunks, top_k=top_k)
+    ranked, url = retriever.rank_chunks(rank_against or query, chunks, top_k=top_k)
+
+    rows = _ranked_rows(articles, rank) if rank is not None else []
+    if not rows:
+        return ranked, url
+    print(f"[Program] TableRank({rank}) -> {len(rows)} row(s): "
+          + " | ".join(r[:90] for r, _ in rows))
+    # The row's article is the citation: it is the evidence that states the rank.
+    return [r for r, _ in rows] + ranked, rows[0][1]
+
+
+# A table's rank column, as table_sentences renders its header.
+_RANK_HEADER = r'(?:rank|no\.?|#|pos\.?|position)'
+
+# Rows taken per lookup. One table per article is the usual case; two allows a
+# second list to disagree with the first, which NLI then sees.
+RANKED_ROWS_MAX = 2
+
+
+def _ranked_rows(articles: list[tuple[str, str]], rank: int) -> list[tuple[str, str]]:
+    """
+    TableRank(k): the rows whose rank cell is k, from the retrieved articles'
+    tables — selected by VALUE, not by similarity.
+
+    WHY NOT RANK THE ROWS LIKE ANY OTHER CHUNK. Measured on 'List of highest
+    mountains on Earth' with all 120 rows as chunks, the query 'second highest
+    peak Earth' selected the rows ranked 11, 12, 57 and 60 — the ones whose
+    names contain 'Peak'. Nothing in a similarity score maps 'second' to
+    'Rank: 2'; every row looks alike except for that one cell. A rank is a
+    lookup on structure, which is how table fact-checking treats it (TabFact's
+    argmax/argmin program functions, KoPL's comparison operators), so it is
+    done as one.
+
+    WHAT KEEPS A WRONG TABLE OUT. A row with 'Rank: 2' in a list ranked by some
+    other quantity (discharge, prominence) is still a candidate here. The NLI
+    kind check is what rejects it: the row must entail the claim restated about
+    its name, and "List of rivers by discharge - Rank: 2; River: Congo" does
+    not entail "the Congo is the second-longest river".
+    """
+    pattern = re.compile(rf' - {_RANK_HEADER}\s*:\s*{rank}\.?;', re.I)
+    rows = []
+    for content, url in articles:
+        if retriever.TABLE_MARKER not in content:
+            continue
+        for line in content.split(retriever.TABLE_MARKER, 1)[1].split("\n"):
+            if pattern.search(line):
+                rows.append((line.strip(), url))
+                break                # one row per article: its first ranked table
+        if len(rows) >= RANKED_ROWS_MAX:
+            break
+    return rows
 
 
 def _call_answer_model(prompt: str) -> str:
@@ -467,17 +1043,28 @@ def _answer_is_grounded(answer: str, chunks: list[str]) -> bool:
     extractor's faithfulness gate, same reason.
     """
     haystack = " ".join(chunks).lower()
-    words = [w for w in re.findall(r"[a-z0-9]+", answer.lower()) if len(w) >= 4]
+    # Short words are skipped as noise ('of', 'the') — except a token carrying a
+    # digit, which is a name: 'K2' was rejected as "not in the evidence" while
+    # the evidence was K2's own article. Short tokens must match as whole words,
+    # so 'k2' is not found inside 'k2-18b'.
+    words = [w for w in re.findall(r"[a-z0-9]+", answer.lower())
+             if len(w) >= 4 or any(c.isdigit() for c in w)]
     if not words:
         return False
-    return all(w in haystack for w in words)
+    return all(
+        w in haystack if len(w) >= 4
+        else re.search(rf'(?<![a-z0-9-]){re.escape(w)}(?![a-z0-9-])', haystack)
+        for w in words
+    )
 
 
 def _handle_question(query: str,
                      fallback_queries: tuple[str, ...] = (),
                      type_word: str = "",
                      claim: str = "",
-                     subject: str = ""
+                     subject: str = "",
+                     rank: int | None = None,
+                     rejected: list | None = None,
                      ) -> tuple[str | None, list[str], str, bool]:
     """
     Question(query), retried against `fallback_queries` only if it finds nothing.
@@ -490,7 +1077,7 @@ def _handle_question(query: str,
     ner.build_query does append it beside the entity queries — so the verifier
     path already works that way. _superlative_program is the path that does not:
     it sets query=category and _retrieve runs one fetch, so the subject's own
-    article is never read except by _handle_corroborate on the REFUTES branch.
+    article is never read on the category path.
 
     Wiring the subject query in as documented is right. Wiring it in by POOLING
     both into this step's evidence is not, and would undo the reason the
@@ -521,7 +1108,8 @@ def _handle_question(query: str,
     rationale instead of presenting the two as equivalent.
     """
     answer, chunks, url = _question_once(query, type_word=type_word,
-                                         claim=claim, subject=subject)
+                                         claim=claim, subject=subject, rank=rank,
+                                         rejected=rejected)
     if answer is not None:
         return answer, chunks, url, False
 
@@ -532,7 +1120,7 @@ def _handle_question(query: str,
               f"fallback query '{fallback}'.")
         fb_answer, fb_chunks, fb_url = _question_once(
             fallback, rank_against=query, type_word=type_word,
-            claim=claim, subject=subject,
+            claim=claim, subject=subject, rank=rank, rejected=rejected,
         )
         if fb_answer is not None:
             return fb_answer, fb_chunks, fb_url, True
@@ -548,7 +1136,9 @@ def _question_once(query: str,
                    rank_against: str | None = None,
                    type_word: str = "",
                    claim: str = "",
-                   subject: str = "") -> tuple[str | None, list[str], str]:
+                   subject: str = "",
+                   rank: int | None = None,
+                   rejected: list | None = None) -> tuple[str | None, list[str], str]:
     """
     One Question attempt: retrieve, ask, validate. Returns the entity or None.
 
@@ -556,9 +1146,9 @@ def _question_once(query: str,
     both use it in preference to `query`, so the model is still asked the
     CATEGORY question even when the articles were fetched by subject name.
 
-    `type_word` is supplied by the caller from the claim's own parse. It falls
-    back to _type_word(query) only when absent, which keeps this function usable
-    standalone and keeps its existing unit tests meaningful.
+    `type_word` is supplied by the caller from the claim's own parse. When it is
+    empty the prompt asks for a name of any kind rather than guessing a type —
+    see ner.superlative_type_word for why the type cannot be read off the query.
 
     Returns None rather than guessing whenever the evidence does not clearly
     answer, because None becomes NOT ENOUGH INFO downstream and a wrong name
@@ -580,9 +1170,8 @@ def _question_once(query: str,
     itself never narrowed what kind of answer is wanted. That has to happen
     here, before generation, not in a filter afterward.
 
-    The query already carries the answer to "what kind": _type_word extracts
-    it ('settlement', 'building', 'river') from the same predicate query this
-    function is answering. Telling the model directly — answer with the
+    The claim already carries the answer to "what kind": the frame's type_word
+    ('settlement', 'building', 'river'). Telling the model directly — answer with the
     {type_word}'s own name, not a person connected to it — removes the
     ambiguity that let the wrong pick happen, rather than catching it once it
     already has. The downstream check stays; a prompt instruction is a
@@ -591,12 +1180,11 @@ def _question_once(query: str,
     """
     asked = rank_against or query
 
-    chunks, url = _retrieve(query, QUESTION_TOP_K, rank_against=rank_against)
+    chunks, url = _retrieve(query, QUESTION_TOP_K, rank_against=rank_against, rank=rank)
     if not chunks:
         print(f"[Program] Question('{query}') — no evidence retrieved.")
         return None, [], ""
 
-    type_word = type_word or _type_word(asked) or ""
     if type_word:
         kind_rule = (
             f"- The answer is the {type_word} itself — its own name. Do NOT answer "
@@ -634,6 +1222,11 @@ Answer:"""
         return None, chunks, url
 
     if not _answer_is_right_kind(answer, asked, chunks, claim=claim, subject=subject):
+        # Grounded but not confirmed: the evidence names it, without stating
+        # it holds the record. Kept for a caller that can check it another way
+        # (the Wikidata route); never a verdict on its own.
+        if rejected is not None:
+            rejected.append(answer)
         return None, chunks, url
 
     print(f"[Program] Question('{query}') -> '{answer}'")
@@ -735,7 +1328,7 @@ def _answer_is_right_kind(answer: str, query: str, chunks: list[str],
     read off the query. Every part of that was a string rule standing in for a
     judgement about meaning, and each broke on live input:
 
-      - the type word itself: _type_word returned 'states' (the scope) and then
+      - the type word itself: _type_word (since removed) returned 'states' (the scope) and then
         'land' (a modifier) before being fixed, and still returns the scope
         noun when the scope is a common noun ('planet', 'history');
       - synonyms: evidence saying 'largest ANIMAL' failed a query about the
@@ -793,74 +1386,6 @@ def _answer_is_right_kind(answer: str, query: str, chunks: list[str],
     return False
 
 
-def _type_word(query: str) -> str | None:
-    """
-    The noun in the predicate query that names what is being ranked.
-
-    'earliest European permanent settlement United States' -> 'settlement'
-
-    Taken from the parse rather than by position: the last token is 'States'
-    here, which names the SCOPE of the superlative, not its TYPE.
-
-    THAT COMMENT WAS ASPIRATIONAL, NOT MEASURED. build_predicate_query's output
-    is a keyword fragment, not a sentence, and en_core_web_sm parses this exact
-    string as ONE noun chunk — 'European permanent settlement United States' —
-    headed by 'States', the same rightward-compounding rule that makes 'leg'
-    the head of 'kitchen table leg'. The first loop below used to accept a
-    PROPN root as well as a NOUN one, so it took that chunk's root and returned
-    'states' without ever reaching the token scan beneath it, which does find
-    'settlement' (tagged NOUN, sitting right there in the parse).
-
-    THIS WAS NOT A LATENT RISK. Run live against the real Jamestown claim with
-    real Wikipedia retrieval (not verifier_probe's fixed evidence): the answer
-    model returned 'Juan Ponce de León' for the settlement question, and this
-    function — checked at that moment — returned 'states', which 'Juan Ponce
-    de León' co-occurs with in any sentence mentioning "a United States
-    territory". _answer_is_right_kind passed a person as a settlement and
-    _handle_match returned a confident REFUTES, sourced to a sentence that
-    never called him a settlement. This is the exact failure the function's
-    own docstring says it exists to catch — reproduced against the case that
-    motivated writing it.
-
-    THE SCOPE ENTITY IS ALWAYS PROPN, BY CONSTRUCTION. build_predicate_query
-    keeps NOUN/PROPN/ADJ/NUM content words after the subject is stripped, and
-    the trailing scope ('United States', 'East Asia') is always the proper
-    noun at the end; the type word ('settlement', 'building', 'river') is
-    always the common noun before it. So the fix is not a better parse of the
-    fragment, it is to stop trusting the chunk's root at all: restrict the
-    first loop to NOUN only. A PROPN-rooted chunk falls straight through to
-    the second loop, which was already correct and is now reachable.
-
-    THE FALLBACK LOOP HAD THE SAME ONE-NOUN ASSUMPTION AS THE FIRST. Live
-    query 'largest terrestrial land animal Earth' (from "...the largest
-    living terrestrial land animal on Earth" with 'on' stripped): spaCy again
-    roots the whole span at 'Earth' (PROPN), so the first loop correctly
-    declines. The fallback then scanned tokens in TEXTUAL ORDER and returned
-    the first NOUN, which is 'land' — a compound MODIFIER of 'animal', not
-    the type being asked about. Every prior example ('settlement United
-    States') only ever had one NOUN before the trailing proper-noun run, so
-    this branch was never exercised against a multi-noun compound until now.
-
-    Fed downstream, type_word='land' produced the instruction "the answer is
-    the land itself... not a person connected to it" — nonsense for a
-    question about an animal — and phi3:mini answered UNKNOWN despite the
-    evidence stating the answer plainly. Confirmed with
-    `python -c "import Pipeline.program as p; print(p._type_word('largest
-    terrestrial land animal Earth'))"` -> 'land', before and after fix.
-
-    English compounds are right-headed ('land animal' is a kind of animal,
-    not a kind of land), so the LAST noun before the trailing proper-noun run
-    is the type word, not the first. Taking the last NOUN still returns
-    'settlement' for the single-noun cases above.
-    """
-    doc = ner.NLP(query)
-    for chunk in doc.noun_chunks:
-        if chunk.root.pos_ == "NOUN":
-            return chunk.root.text.lower()
-    nouns = [token.text.lower() for token in doc if token.pos_ == "NOUN"]
-    return nouns[-1] if nouns else None
-
-
 def _sentences(text: str) -> list[str]:
     """Cheap sentence split. No spaCy: this runs over long evidence chunks."""
     return [s for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
@@ -872,8 +1397,7 @@ def _head_and_modifiers(name: str) -> tuple[str | None, set[str]]:
 
     The HEAD is what the name is a kind of; the MODIFIERS say which one. English
     compounds are right-headed — 'land animal' is a kind of animal, not a kind
-    of land — so the head is the last content word. Same rule _type_word relies
-    on, for the same reason.
+    of land — so the head is the last content word.
     """
     doc = ner.NLP(name)
     content = [t for t in doc
@@ -921,14 +1445,13 @@ def _handle_match(answer: str | None, subject: str) -> tuple[str, str]:
          disjoint is categorical and needs no threshold to tune.
 
       3. DIFFERENT HEADS. A genuine rival: 'Saint Augustine' against
-         'Jamestown'. Keeps the previous REFUTES, which _handle_corroborate
-         then requires a second independent source to sustain.
+         'Jamestown'. REFUTES — the rival has already passed
+         _answer_is_right_kind, so the evidence states it holds the record.
 
     KNOWN GAP: an alias sharing no words with the subject ('Loxodonta
-    africana') reaches tier 3 and is reported as a rival. Corroboration will
-    usually sustain it, since the subject's own article does mention its
-    scientific name. Resolving that needs canonical titles from Wikipedia
-    redirects, not a cleverer string rule.
+    africana') reaches tier 3 and is reported as a rival — a wrong REFUTES.
+    Resolving that needs canonical titles from Wikipedia redirects, not a
+    cleverer string rule.
     """
     if answer is None:
         return ("NOT ENOUGH INFO",
@@ -961,54 +1484,85 @@ def _handle_match(answer: str | None, subject: str) -> tuple[str, str]:
             f"'{subject}' as the claim asserts.")
 
 
-def _handle_corroborate(answer: str, subject: str) -> tuple[bool, list[str], str]:
+# ── Quantities ────────────────────────────────────────────────────────────────
+# UNIT CONVERSION IS PINT'S, NOT A HAND-WRITTEN TABLE. The table this replaced
+# (_UNIT_TO_BASE) listed metres, feet and miles and nothing else, so every area
+# and mass claim was unreadable — and the 'count' and 'year' families declared
+# in the dimension lexicon had no entry in it at all, which meant every
+# population comparison returned NOT ENOUGH INFO without ever reading a number.
+#
+# Pint is pinned below 0.25 in requirements.txt: 0.24.4 is the newest release
+# pip resolves for this project's Python 3.10 venv.
+_UREG = pint.UnitRegistry()
+
+_FAMILY_DIMENSIONALITY = {
+    "length": _UREG.get_dimensionality("[length]"),
+    "area":   _UREG.get_dimensionality("[length] ** 2"),
+    "mass":   _UREG.get_dimensionality("[mass]"),
+}
+
+# A number not glued to a word ('K2'), then a unit: 'm', 'ft', 'km2', 'km²',
+# 'sq mi', 'square kilometres'. The trailing guard rejects 'km/h' and 'm/s' —
+# a speed in a sentence about length is not a length.
+_NUM = r'(?<![\w.])(\d[\d,]*(?:\.\d+)?)'
+_SCALE_WORD = r'(?:\s*(thousand|million|billion))?'
+_MEASURE_RE = re.compile(
+    _NUM + _SCALE_WORD + r'\s*((?:sq(?:uare)?\.?\s+)?[A-Za-z]+(?:²|2)?)(?![\w/²])', re.I
+)
+
+# Unit-less tallies: '1.4 billion', '8,336,817'. The scale word belongs to the
+# number, not to a unit — in both patterns.
+_COUNT_RE = re.compile(_NUM + _SCALE_WORD + r'(?![\w%])', re.I)
+_SCALE = {"thousand": 1e3, "million": 1e6, "billion": 1e9}
+
+
+def _to_base(number: str, unit: str, family: str) -> float | None:
     """
-    Does the SUBJECT'S OWN article back up the rival Question() found?
+    `number unit` in the family's SI base unit (m, m², kg), or None.
 
-    WHY THIS EXISTS. Question()'s retrieval is aimed at the CATEGORY
-    ('earliest European permanent settlement United States'), not the
-    subject, which is the whole point of the mechanism — it is how Saint
-    Augustine gets found at all. But that same aim is the risk: Wikipedia's
-    search on an artificial category phrase is not always good. Measured on
-    two claims sharing this exact machinery: 'earliest European permanent
-    settlement United States' scored 0.72 and reached the right article;
-    'earliest permanent European settlement East Asia' scored 0.27 and
-    reached 'Indo-European migrations' — a keyword collision, not an answer.
-    A single low-confidence retrieval is standing between REFUTES and a
-    citation that does not actually support it.
-
-    So a REFUTES verdict gets a second, independent source before it is
-    trusted: retrieve the SUBJECT's own article (the same way the ordinary
-    verifier path already does for every claim) and check whether the rival
-    name Question() found appears there too. Two retrieval calls landing on
-    the same rival, aimed at two different queries, is a much stronger signal
-    than either one alone.
-
-    WHAT A MISS MEANS, AND WHAT IT DOES NOT. If the subject's own article
-    never mentions the rival, that is NOT evidence the rival is wrong — most
-    articles do not enumerate every earlier claimant, which is exactly why
-    Question() had to search the category in the first place. A miss here
-    means only "not corroborated," and the caller downgrades to NOT ENOUGH
-    INFO rather than treating the absence as a refutation of the refutation.
-    Silence is not confirmation in either direction — see verifier.py's rule 6
-    for the same principle applied to the single-shot prompt.
-
-    COST. One more retrieval call (~5-15s), spent only on the REFUTES branch,
-    where the failure this guards against — a confident wrong verdict with a
-    citation attached — is the one this whole project exists to prevent.
+    PINT PARSES ENGLISH. Measured: pint reads 'in' as inch and 't' as tonne, so
+    "8,849 in 2020" would be a length of 8,849 inches. A unit is therefore
+    refused when it is an English stop word or a single letter other than 'm'
+    — the only one-letter unit encyclopedia prose uses after a number.
     """
-    chunks, url = _retrieve(subject, QUESTION_TOP_K)
-    if not chunks:
-        return False, [], ""
+    u = unit.lower().strip()
+    u = re.sub(r'^sq(?:uare)?\.?\s+', 'square ', u)
+    u = re.sub(r'(?<=[a-z])2$', '**2', u)
+    bare = u.split()[-1]
+    if bare in STOP_WORDS or (len(bare) == 1 and bare != "m"):
+        return None
+    try:
+        q = _UREG.Quantity(float(number.replace(",", "")), u)
+    except (pint.errors.PintError, ValueError, TypeError):
+        return None
+    if q.dimensionality != _FAMILY_DIMENSIONALITY.get(family):
+        return None
+    return float(q.to_base_units().magnitude)
 
-    answer_low = answer.lower()
-    found = any(answer_low in chunk.lower() for chunk in chunks)
-    return found, chunks, url
 
+def _measurements(sentence: str, family: str) -> list[tuple[float, str]]:
+    """Every (value_in_base_units, as_written) of `family` in one sentence."""
+    if family == "count":
+        found = []
+        for m in _COUNT_RE.finditer(sentence):
+            digits, scale = m.group(1), m.group(2)
+            # A bare four-digit number is a year ('In 2020 the population...'),
+            # not a tally, unless written with a separator or a scale word.
+            if (not scale and "," not in digits and "." not in digits
+                    and 1000 <= int(digits) <= 2100):
+                continue
+            value = float(digits.replace(",", "")) * _SCALE.get((scale or "").lower(), 1)
+            found.append((value, m.group(0).strip()))
+        return found
 
-_NUM = r'(\d[\d,]*(?:\.\d+)?)'
-_UNIT = r'(' + '|'.join(sorted(_UNIT_TO_BASE, key=len, reverse=True)) + r')'
-_QUANTITY_RE = re.compile(_NUM + r'\s*' + _UNIT + r'\b', re.I)
+    found = []
+    for m in _MEASURE_RE.finditer(sentence):
+        value = _to_base(m.group(1), m.group(3), family)
+        if value is not None:
+            # '9.8 million km²': the scale multiplies the number, not the unit.
+            value *= _SCALE.get((m.group(2) or "").lower(), 1)
+            found.append((value, m.group(0).strip()))
+    return found
 
 
 def _handle_quantity(entity: str, dimension: str, family: str):
@@ -1044,7 +1598,8 @@ def _handle_quantity(entity: str, dimension: str, family: str):
     if not chunks:
         return None, "", [], ""
 
-    keywords = {dimension} | {k for k, v in _DIMENSIONS.items() if v[0] == dimension}
+    spec = _DIMENSION_SPECS.get(dimension)
+    keywords = set(spec.keywords) if spec else {dimension}
     entity_tokens = [t.lower() for t in re.findall(r"[A-Za-z]+", entity) if len(t) >= 4]
 
     best = None
@@ -1055,16 +1610,12 @@ def _handle_quantity(entity: str, dimension: str, family: str):
                 continue
             names_entity = any(t in low for t in entity_tokens) if entity_tokens else False
 
-            for m in _QUANTITY_RE.finditer(sentence):
-                unit = m.group(2).lower()
-                if _UNIT_FAMILY.get(unit) != family:
-                    continue
-                value = float(m.group(1).replace(",", "")) * _UNIT_TO_BASE[unit]
+            for value, display in _measurements(sentence, family):
                 # Lower sorts first: entity-naming sentences beat others, then
                 # larger values beat smaller ones.
                 rank = (0 if names_entity else 1, -value)
                 if best is None or rank < best[0]:
-                    best = (rank, value, m.group(0), sentence)
+                    best = (rank, value, display, sentence)
 
     if best is None:
         print(f"[Program] Quantity('{entity}', {dimension}) — no value found in any "
@@ -1078,8 +1629,13 @@ def _handle_quantity(entity: str, dimension: str, family: str):
 
 
 def _handle_compare(a, b, subject: str, other: str, dimension: str,
-                    disp_a: str, disp_b: str) -> tuple[str, str]:
-    """Compare(q_1, q_2) -> (label, rationale). Arithmetic, in Python."""
+                    disp_a: str, disp_b: str, direction: str = "max") -> tuple[str, str]:
+    """
+    Compare(q_1, q_2) -> (label, rationale). Arithmetic, in Python.
+
+    `direction` is the claim's: 'max' asserts the subject's value is the larger
+    ("taller than"), 'min' that it is the smaller ("less populous than").
+    """
     if a is None or b is None:
         missing = subject if a is None else other
         return ("NOT ENOUGH INFO",
@@ -1104,17 +1660,110 @@ def _handle_compare(a, b, subject: str, other: str, dimension: str,
                 f"{other} {disp_b} — differ by a factor of {ratio:.0f}, which "
                 f"means at least one was misread. No comparison was made.")
 
-    if a > b:
+    if a == b:
+        return ("NOT ENOUGH INFO",
+                f"The evidence gives both {subject} and {other} as {disp_a}, which "
+                f"does not settle the comparison.")
+
+    holds = a > b if direction == "max" else a < b
+    if holds:
         return ("SUPPORTS",
                 f"The evidence gives {subject} as {disp_a} and {other} as "
                 f"{disp_b}, so the claim holds.")
-    if a < b:
-        return ("REFUTES",
-                f"The evidence gives {subject} as {disp_a} and {other} as "
-                f"{disp_b}, so the claim is false.")
-    return ("NOT ENOUGH INFO",
-            f"The evidence gives both {subject} and {other} as {disp_a}, which "
-            f"does not settle the comparison.")
+    return ("REFUTES",
+            f"The evidence gives {subject} as {disp_a} and {other} as "
+            f"{disp_b}, so the claim is false.")
+
+
+def _numeric_corroborate(rival: str, subject: str, frame: ComparisonFrame):
+    """
+    Does the rival Question() named actually BEAT the subject on the claim's
+    own dimension? -> (True | False | None, trace_line, chunks, rationale)
+
+    The second, independent route for a rank-1 REFUTES. The kind check has
+    already required a passage ENTAILING the rival's record; when the
+    superlative names a measurable dimension a check from different evidence
+    is available too: read both values and compare them in the claim's
+    direction.
+
+        True   the rival's value wins       -> REFUTES is corroborated
+        False  the subject's value wins     -> the two routes disagree -> NEI
+        None   a value could not be read    -> fall back to the mention check
+
+    Rank 1 only. For "the second-highest", a rival named second-highest may
+    stand above or below the subject, so the comparison corroborates nothing.
+    """
+    spec = _DIMENSION_SPECS[frame.dimension]
+    a, disp_a, chunks_a, _ = _handle_quantity(rival, spec.name, spec.family)
+    b, disp_b, chunks_b, _ = _handle_quantity(subject, spec.name, spec.family)
+
+    # "Does the rival hold the record against the subject?" — a claim about
+    # the rival, in the superlative's own direction.
+    label, rationale = _handle_compare(a, b, rival, subject, spec.name,
+                                       disp_a, disp_b, frame.direction)
+    verdict = {"SUPPORTS": True, "REFUTES": False}.get(label)
+    if verdict is not None:
+        # _handle_compare's wording ("so the claim holds") is about the
+        # rival's claim; the caller quotes this inside a verdict on the
+        # subject's, so state the values without a conclusion.
+        rationale = (f"the evidence gives {rival} as {disp_a} and {subject} "
+                     f"as {disp_b}.")
+    outcome = {True: "rival wins", False: "subject wins", None: "undecided"}[verdict]
+    trace = (f"check = Compare(Quantity('{rival}'), Quantity('{subject}'), "
+             f"{spec.name}, {frame.direction}) -> "
+             f"{disp_a or 'UNKNOWN'} vs {disp_b or 'UNKNOWN'} -> {outcome}")
+    return verdict, trace, chunks_a + chunks_b, rationale
+
+
+def _wikidata_title(name: str) -> str:
+    """An entity name as an English Wikipedia title: first letter capitalised."""
+    name = re.sub(r'^(the|a|an)\s+', '', name.strip(), flags=re.I)
+    return name[:1].upper() + name[1:]
+
+
+def _format_value(value: float, dimension: str) -> str:
+    family = _DIMENSION_SPECS[dimension].family
+    if family == "area":
+        return f"{value / 1e6:,.0f} km²"
+    if family == "length":
+        return f"{value:,.0f} m"
+    if family == "mass":
+        return f"{value:,.0f} kg"
+    return f"{value:,.0f}"
+
+
+def _wikidata_alone_applies(frame: ComparisonFrame) -> bool:
+    """May Wikidata values alone refute this claim? See the call site."""
+    return (frame.rank == 1 and frame.dimension is not None and frame.bare
+            and frame.world_scope
+            and wikidata.supports(frame.type_word, frame.dimension))
+
+
+def _wikidata_beats(rival: str, subject: str, frame: ComparisonFrame):
+    """
+    Does `rival` beat `subject` on the frame's dimension, by Wikidata's values?
+    -> (True | False | None, trace_line, rationale_fragment)
+
+    None when either value is missing, the two resolve to the same entity, or
+    they are equal — the caller then falls back to whatever it had.
+    """
+    if frame.dimension is None or not wikidata.supports(frame.type_word, frame.dimension):
+        return None, f"check = Wikidata({frame.type_word}, {frame.dimension}) -> not mapped", ""
+
+    a = wikidata.value(_wikidata_title(rival), frame.type_word, frame.dimension)
+    b = wikidata.value(_wikidata_title(subject), frame.type_word, frame.dimension)
+    if a is None or b is None or a.qid == b.qid or a.value == b.value:
+        return (None, f"check = Wikidata('{rival}', '{subject}', {frame.dimension}) "
+                      f"-> undecided", "")
+
+    beats = a.value > b.value if frame.direction == "max" else a.value < b.value
+    why = (f"Wikidata gives {rival} ({a.qid}) as "
+           f"{_format_value(a.value, frame.dimension)} and {subject} ({b.qid}) as "
+           f"{_format_value(b.value, frame.dimension)}.")
+    line = (f"check = Wikidata('{rival}' {_format_value(a.value, frame.dimension)}, "
+            f"'{subject}' {_format_value(b.value, frame.dimension)}, {frame.direction}) "
+            f"-> {'rival wins' if beats else 'subject wins'}")
+    return beats, line, why
 
 
 # ── Execution ─────────────────────────────────────────────────────────────────
@@ -1125,9 +1774,10 @@ def execute(program: Program, claim: str) -> ProgramOutcome | None:
     Returns None if execution could not proceed at all, which sends the caller
     back to single-shot verification rather than leaving the claim unchecked.
     """
-    if program.kind == "superlative":
-        category = program.steps[0].args[0]
-        subject = program.steps[1].args[1]
+    frame = program.frame
+    if frame.rank is not None:
+        category, subject = frame.query, frame.subject
+        rejected: list[str] = []
 
         answer, chunks, url, from_fallback = _handle_question(
             category,
@@ -1135,6 +1785,8 @@ def execute(program: Program, claim: str) -> ProgramOutcome | None:
             type_word=program.type_word,
             claim=claim,
             subject=subject,
+            rank=frame.rank,
+            rejected=rejected,
         )
         label, rationale = _handle_match(answer, subject)
 
@@ -1145,62 +1797,115 @@ def execute(program: Program, claim: str) -> ProgramOutcome | None:
             f"label = Match(answer_1, '{subject}') -> {label}",
         ]
 
-        # A SUPPORTS that came from the subject's own article is not independent
-        # evidence of a ranking — it is the subject asserting its own record.
-        # Keep the label; say where it came from.
+        # A SUPPORTS FROM THE SUBJECT'S OWN ARTICLE IS NOT GIVEN. It is the
+        # subject asserting its own record, and that is exactly where a false
+        # superlative hides: live, Jamestown's article says "the first permanent
+        # ENGLISH settlement in the Americas", NLI read that as entailing
+        # "earliest EUROPEAN permanent settlement in the United States" at
+        # p=0.97, and the claim — false, Saint Augustine is older — came back
+        # SUPPORTS. This used to be a note appended to the SUPPORTS; it is now
+        # NOT ENOUGH INFO, which is this module's failure direction.
+        #
+        # What the fallback is still for: finding a RIVAL. A subject's article
+        # naming someone else as the record holder ("Kangchenjunga ... third
+        # highest, after Everest and K2") is evidence against its own claim,
+        # and that REFUTES stands.
         if from_fallback and label == "SUPPORTS":
-            rationale += (
-                f" Note: the category search for '{category}' returned no usable "
-                f"evidence, so this rests on '{subject}''s own article rather "
-                f"than an independent search for the record holder."
+            label = "NOT ENOUGH INFO"
+            rationale = (
+                f"The category search for '{category}' named no record holder "
+                f"the evidence confirms. '{subject}''s own article states the "
+                f"record, but a subject's own article cannot establish a "
+                f"ranking against rivals it need not mention, so no verdict is "
+                f"given."
             )
 
-        # REFUTES rests on ONE retrieval call aimed at an artificial category
-        # phrase — see _handle_corroborate for why that is not always trusted
-        # alone. Require a second, independent source before keeping it.
-        if label == "REFUTES":
-            corroborated, subj_chunks, subj_url = _handle_corroborate(answer, subject)
-            program.trace.append(
-                f"corroborate = SubjectArticle('{subject}') mentions '{answer}' "
-                f"-> {corroborated}"
-            )
-            if corroborated:
-                chunks = chunks + subj_chunks
-            else:
+        # A REFUTES already rests on the rival being ENTAILED, at p >= 0.9, by a
+        # passage stating the claim's record about it — _answer_is_right_kind
+        # is the corroboration. When the dimension is measurable a second,
+        # independent route is available and the numbers must not disagree.
+        #
+        # THE SUBJECT-ARTICLE MENTION CHECK THAT USED TO RUN HERE IS GONE. It
+        # was added when the kind check accepted at p=0.5, and it was a
+        # substring search: does the subject's article contain the rival's
+        # name? Under the raised threshold it only ever downgraded correct
+        # verdicts — live, "Kangchenjunga is the second-highest peak" went to
+        # NOT ENOUGH INFO with 'K2' entailed at p=0.97, because four chunks of
+        # the Kangchenjunga article did not happen to name K2. And it would
+        # have confirmed a wrong rival that the subject's article merely names.
+        #
+        # Structured values first: Wikidata's are typed and unit-normalised,
+        # where the prose route reads numbers out of sentences (and once read
+        # Mauna Kea as 9,330 m). The prose route stays as the fallback for an
+        # entity or category Wikidata cannot answer.
+        if label == "REFUTES" and frame.dimension is not None and frame.rank == 1:
+            numeric, line, num_rationale = _wikidata_beats(answer, subject, frame)
+            num_chunks = []
+            if numeric is None:
+                numeric, line, num_chunks, num_rationale = _numeric_corroborate(
+                    answer, subject, frame)
+            program.trace.append(line)
+            chunks = chunks + num_chunks
+            if numeric is True:
+                rationale += f" The values agree: {num_rationale}"
+            elif numeric is False:
                 label = "NOT ENOUGH INFO"
                 rationale = (
                     f"A search for '{category}' named '{answer}' as holding this "
-                    f"distinction, but '{subject}''s own article does not "
-                    f"corroborate that, so the rival finding could not be "
-                    f"confirmed from a second source."
+                    f"distinction, but the values read from the evidence put "
+                    f"'{subject}' ahead: {num_rationale} The two routes "
+                    f"disagree, so no verdict is given."
                 )
-                if subj_chunks:
-                    chunks = chunks + subj_chunks
-                    url = url or subj_url
+
+        # NO CONFIRMED HOLDER, BUT A NAMED CANDIDATE THAT BEATS THE SUBJECT.
+        # "K2 is the highest mountain in the world": the table row for Everest
+        # entails "Everest is the highest mountain" at only p=0.80, so the kind
+        # check rejected it and the claim had no answer. It does not need one.
+        # The claim is refuted by ANY member of the class that beats K2, and
+        # Wikidata gives Everest 8,850 m against K2's 8,611 m.
+        #
+        # Sound only under three conditions, all checked by
+        # _wikidata_alone_applies: rank 1 (a rival above the subject refutes
+        # "the highest", but says nothing about "the second-highest"); a
+        # world-wide scope ("the highest mountain in Pakistan" is not refuted
+        # by Everest); and a bare category ("the highest UNCLIMBED mountain"
+        # is not refuted by a climbed one). The candidate must also be a member
+        # of the category's Wikidata class — wikidata.value checks that.
+        if answer is None and rejected and _wikidata_alone_applies(frame):
+            for candidate in dict.fromkeys(rejected):
+                if _handle_match(candidate, subject)[0] == "SUPPORTS":
+                    continue             # the candidate IS the subject
+                beats, line, why = _wikidata_beats(candidate, subject, frame)
+                program.trace.append(line)
+                if beats:
+                    label = "REFUTES"
+                    rationale = (
+                        f"The evidence names '{candidate}', and {why} A "
+                        f"{frame.type_word} that exceeds '{subject}' exists, so "
+                        f"'{subject}' is not the {frame.marker} {frame.type_word}."
+                    )
+                    break
 
         program.chunks, program.source_url = chunks, url
 
-    elif program.kind == "comparative":
-        subject, dimension, family = program.steps[0].args
-        other = program.steps[1].args[0]
+    else:
+        spec = _DIMENSION_SPECS[frame.dimension]
+        subject, other = frame.subject, frame.reference
 
-        a, disp_a, chunks_a, url_a = _handle_quantity(subject, dimension, family)
-        b, disp_b, chunks_b, _ = _handle_quantity(other, dimension, family)
+        a, disp_a, chunks_a, url_a = _handle_quantity(subject, spec.name, spec.family)
+        b, disp_b, chunks_b, _ = _handle_quantity(other, spec.name, spec.family)
 
         label, rationale = _handle_compare(
-            a, b, subject, other, dimension, disp_a, disp_b
+            a, b, subject, other, spec.name, disp_a, disp_b, frame.direction
         )
 
         program.trace = [
-            f"q_1 = Quantity('{subject}', {dimension}) -> {disp_a or 'UNKNOWN'}",
-            f"q_2 = Quantity('{other}', {dimension}) -> {disp_b or 'UNKNOWN'}",
-            f"label = Compare(q_1, q_2) -> {label}",
+            f"q_1 = Quantity('{subject}', {spec.name}) -> {disp_a or 'UNKNOWN'}",
+            f"q_2 = Quantity('{other}', {spec.name}) -> {disp_b or 'UNKNOWN'}",
+            f"label = Compare(q_1, q_2, {frame.direction}) -> {label}",
         ]
         program.chunks = chunks_a + chunks_b
         program.source_url = url_a
-
-    else:
-        return None
 
     for line in program.trace:
         print(f"[Program]   {line}")

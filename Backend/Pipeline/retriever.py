@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 import wikipedia
+from bs4 import BeautifulSoup
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException
 from langchain_community.retrievers import WikipediaRetriever
@@ -223,6 +224,57 @@ WIKI_NON_ARTICLE_NAMESPACES = {
 # chunk reachable that previously was not. select_top_chunks' rarest-token
 # guarantee is what holds the line there.
 DOC_CONTENT_CHARS_MAX = 20000
+
+# ── Table evidence ────────────────────────────────────────────────────────────
+# TABLE_ROWS: read an article's tables as well as its prose.
+#
+# page.content is the plain-text extract, and THE EXTRACT DROPS EVERY TABLE.
+# Measured: 'List of highest mountains on Earth' returns 6,863 characters in
+# which 'K2' occurs zero times — the ranking that answers "what is the
+# second-highest peak?" lives entirely in the table. The retriever found the
+# right page and handed on its introduction, and with no answer present the
+# answer model picked the nearest lookalike: Huascarán, "a very close second"
+# for a different record.
+#
+# Each data row of a `wikitable` becomes one sentence:
+#
+#   "List of highest mountains on Earth - Rank: 2; Mountain name(s): K2;
+#    Height (rounded): 8,611 metres (28,251 ft); ..."
+#
+# THE WORDING WAS CHOSEN BY THE NLI MODEL, NOT BY TASTE. P(entailment) of
+# "K2 is the second-highest peak on Earth" from candidate renderings of the
+# same row:
+#
+#   natural sentence, all columns ("K2 is ranked second ... with height ...")  0.30
+#   natural sentence, height only                                              0.61
+#   key-value, all columns  (the format above)                                 0.94
+#
+# and the same row gives 0.12 for the false "Kangchenjunga is the second-
+# highest", 0.996 for "K2 is 8,611 metres high", 0.001 for "K2 is the third-
+# highest". Keeping every column means one rendering serves every attribute.
+#
+# COST: one more API request per article loaded (the HTML), cached with it.
+TABLE_ROWS = True
+
+# Bounds, so a 2,000-row list cannot swamp the prose: rows per article, and
+# characters per rendered cell (long cells are notes, not values).
+TABLE_ROWS_MAX = 150
+TABLE_CELL_CHARS_MAX = 80
+
+# Rows follow the prose after this marker, one per line, and are NOT CHUNKED:
+# they are read only by program._ranked_rows, which selects a row by the value
+# of its rank cell.
+#
+# THEY WERE CHUNKED AT FIRST, AND THAT COST A VERDICT. Rows joined the
+# similarity pool beside the prose, and for the Jamestown claim the pool gained
+# 150 rows of 'Languages of the United States' and 131 of 'List of first human
+# settlements'. The passage stating that Saint Augustine was first was pushed
+# out of the selected chunks, nothing left entailed the rival, and the claim
+# fell through to a fallback that wrongly supported it. Similarity ranking
+# cannot pick the right row anyway (it chose the rows ranked 11, 12, 57 and 60
+# for 'second highest peak Earth'), so rows in the pool only ever displaced
+# prose.
+TABLE_MARKER = "\n\n[[TABLE ROWS]]\n"
 
 # ── Chunk config ──────────────────────────────────────────────────────────────
 # CHUNK_SIZE: Target character length per semantic chunk.
@@ -583,7 +635,15 @@ def _load_article_uncached(title: str) -> tuple[tuple[str, str] | None, bool]:
         try:
             page = wikipedia.page(title, auto_suggest=False, redirect=True)
             content = page.content[:DOC_CONTENT_CHARS_MAX]
-            return ((content, page.url), True) if content.strip() else (None, True)
+            if not content.strip():
+                return None, True
+            rows = _page_table_rows(page, title) if TABLE_ROWS else []
+            if rows:
+                print(f"[Retriever] '{title}': {len(rows)} table row(s) added as evidence.")
+                # One row per line after the marker, where program.py looks a
+                # row up by its rank; chunk_articles stops at the marker.
+                content = content + TABLE_MARKER + "\n".join(rows)
+            return (content, page.url), True
         except (wikipedia.exceptions.DisambiguationError,
                 wikipedia.exceptions.PageError) as e:
             # Permanent: this title is not a loadable article. Skip it.
@@ -594,6 +654,127 @@ def _load_article_uncached(title: str) -> tuple[tuple[str, str] | None, bool]:
             if attempt < RETRY_ATTEMPTS:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
     return None, False
+
+
+def _page_table_rows(page, title: str) -> list[str]:
+    """
+    The page's table rows as sentences, or [] when it has none or they cannot
+    be read.
+
+    NOTHING HERE MAY FAIL THE ARTICLE. This runs inside _load_article_uncached's
+    retry loop, after the prose has loaded; an exception escaping it would
+    discard good prose and retry the whole page for the sake of its tables.
+    So every failure — a network error on the HTML, a malformed table, a page
+    object without .html() — costs the tables only.
+    """
+    name = getattr(page, "title", None) or title
+    try:
+        return table_sentences(name, page.html())
+    except Exception as e:
+        print(f"[Retriever] Tables for '{name}' unavailable ({type(e).__name__}) "
+              f"— prose only.")
+        return []
+
+
+_FOOTNOTE = re.compile(r'\[\s*[^\]]{1,24}\s*\]')
+
+
+def _cell_text(cell) -> str:
+    """
+    Visible text of one cell: footnote markers, sort keys and hidden spans
+    removed, and alternatives separated.
+
+    A cell listing several names as list items ('Mount Everest', 'Sagarmatha',
+    'Chomolungma') read as one run-on name, "Mount Everest Sagarmatha
+    Chomolungma". " / " keeps them apart. <br> is NOT treated the same way:
+    headers use it to wrap ("Height<br>(rounded)"), so it stays a space.
+    """
+    for hidden in cell.select('sup.reference, sup.noprint, .sortkey, '
+                              '[style*="display:none"], style'):
+        hidden.decompose()
+    items = cell.find_all("li")
+    for li in items[:-1]:
+        li.append(" / ")
+    text = cell.get_text(" ", strip=True).replace("\xa0", " ").replace("﻿", "")
+    text = _FOOTNOTE.sub("", text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _span(cell, attr: str) -> int:
+    """colspan/rowspan as an int; malformed values ('2;', '') count as 1."""
+    value = str(cell.get(attr, "1")).strip()
+    return max(1, int(value)) if value.isdigit() else 1
+
+
+def _table_grid(table) -> list[list[tuple[str, bool]]]:
+    """
+    The table as a rectangular grid of (text, is_header) cells.
+
+    rowspan and colspan are expanded, so every row has one entry per column and
+    a value spanning three rows ('Himalaya') is repeated on each — the row it
+    describes must carry it, or that row is missing a fact the table states.
+    """
+    grid, carried = [], {}           # carried: column -> [rows_left, cell]
+    for tr in table.find_all("tr"):
+        if tr.find_parent("table") is not table:
+            continue                 # a row of a nested table
+        row, col = {}, 0
+        for cell in tr.find_all(["th", "td"], recursive=False):
+            while col in carried:
+                col += 1
+            value = (_cell_text(cell), cell.name == "th")
+            span_c, span_r = _span(cell, "colspan"), _span(cell, "rowspan")
+            for k in range(span_c):
+                row[col + k] = value
+                if span_r > 1:
+                    carried[col + k] = [span_r - 1, value]
+            col += span_c
+        for c, entry in list(carried.items()):
+            if c not in row:
+                row[c] = entry[1]
+                entry[0] -= 1
+                if entry[0] <= 0:
+                    del carried[c]
+        if row:
+            grid.append([row.get(c, ("", False)) for c in range(max(row) + 1)])
+    return grid
+
+
+def table_sentences(title: str, html_text: str) -> list[str]:
+    """
+    Every data row of every `wikitable` on the page, as one key-value sentence.
+
+        "List of highest mountains on Earth - Rank: 2; Mountain name(s): K2;
+         Height (rounded): 8,611 metres (28,251 ft); Range: Baltoro Karakoram; ..."
+
+    The header is the table's first all-header row. Cells that repeat their
+    header, coordinates (which no claim is checked against and which spend the
+    chunk budget), and empty cells are left out. See TABLE_ROWS for why this
+    format and not a natural-language sentence.
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    sentences = []
+    for table in soup.select("table.wikitable"):
+        grid = _table_grid(table)
+        header_at = next((i for i, row in enumerate(grid)
+                          if row and all(is_th for _, is_th in row)), None)
+        if header_at is None:
+            continue
+        header = [text for text, _ in grid[header_at]]
+
+        for row in grid[header_at + 1:]:
+            if all(is_th for _, is_th in row):
+                continue             # a second header row or a section divider
+            pairs = []
+            for name, (value, _) in zip(header, row):
+                if not name or not value or value == name or "°" in value:
+                    continue
+                pairs.append(f"{name}: {value[:TABLE_CELL_CHARS_MAX]}")
+            if len(pairs) >= 2:
+                sentences.append(f"{title} - " + "; ".join(pairs) + ".")
+            if len(sentences) >= TABLE_ROWS_MAX:
+                return sentences
+    return sentences
 
 
 def _fetch_via_wikipedia_search(query: str) -> list[tuple[str, str]]:
@@ -680,6 +861,8 @@ def chunk_articles(articles: list[tuple[str, str]]) -> list[tuple[str, str]]:
 
     chunks = []
     for article, url in articles:
+        # Table rows are not chunked — see TABLE_MARKER.
+        article = article.split(TABLE_MARKER, 1)[0]
         # Normalize whitespace so sentence boundaries are detectable.
         clean     = re.sub(r'\s+', ' ', article).strip()
         sentences = _split_sentences(clean)
@@ -720,6 +903,12 @@ def chunk_articles(articles: list[tuple[str, str]]) -> list[tuple[str, str]]:
 # add noise without meaning. Previously the inline `len(t) > 2`.
 MIN_SCORE_TOKEN_LENGTH = 3
 
+# Two-character tokens mixing a letter and a digit are names, not noise: 'K2',
+# 'F1', 'C4', 'U2'. The length floor above dropped them, so the query 'K2'
+# had no scoreable token at all and its chunks came back unranked
+# ("No scoreable tokens found in fact").
+_SHORT_CODE = re.compile(r'^(?=.*[a-z])(?=.*\d)[a-z0-9]{2}$')
+
 # USE_IDF_WEIGHTING: weight each matched token by how RARE it is across the
 # chunks retrieved for this claim, instead of counting every token equally.
 #
@@ -752,7 +941,7 @@ def _tokenize(text: str) -> set[str]:
     """Lowercase content tokens used by the ranker."""
     return {
         t for t in re.findall(r'\b[a-zA-Z0-9]+\b', text.lower())
-        if len(t) >= MIN_SCORE_TOKEN_LENGTH
+        if len(t) >= MIN_SCORE_TOKEN_LENGTH or _SHORT_CODE.match(t)
     }
 
 
@@ -1086,7 +1275,14 @@ def rarest_fact_token(fact: str, chunks: list[tuple[str, str]]) -> str | None:
     total = len(chunk_token_sets)
     df = Counter(t for tokens in chunk_token_sets for t in tokens)
 
-    present = [t for t in fact_tokens if df.get(t, 0) > 0]
+    # ORDINALS ARE NEVER THE DECISIVE TOKEN. 'second' in "the second-highest
+    # peak" is rare in a pool about mountains, so it won — and the guarantee
+    # then forced in a passage where Huascarán is "a very close second" for a
+    # different record (farthest point from Earth's centre). A year names the
+    # fact; an ordinal only says which position in SOME ranking, and every
+    # ranking on the page has one. The ordinal still counts in scoring.
+    present = [t for t in fact_tokens
+               if df.get(t, 0) > 0 and t not in ner.ORDINAL_TOKENS]
     if not present:
         return None
 

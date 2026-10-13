@@ -78,6 +78,7 @@ def generate(model: str, prompt: str, *,
              options: dict,
              think: bool | str | None = None,
              keep_alive: str | None = None,
+             format: dict | str | None = None,
              timeout: float | None = None,
              log: bool = True) -> Generation:
     """
@@ -86,6 +87,9 @@ def generate(model: str, prompt: str, *,
     `think=None` OMITS the field rather than sending False. Models without a
     reasoning mode (phi3:mini) never received it before this helper existed,
     and the request each caller sends should not change by being routed here.
+
+    `format` is Ollama's structured-output field: "json", or a JSON schema the
+    reply is constrained to. Omitted when None, like `think`.
 
     Raises requests exceptions unchanged; deciding whether a failed call is
     fatal belongs to the caller.
@@ -96,6 +100,8 @@ def generate(model: str, prompt: str, *,
         payload["think"] = think
     if keep_alive is not None:
         payload["keep_alive"] = keep_alive
+    if format is not None:
+        payload["format"] = format
 
     response = requests.post(backends.generate_url(), json=payload, timeout=timeout)
     response.raise_for_status()

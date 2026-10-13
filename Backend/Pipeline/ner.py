@@ -702,6 +702,22 @@ _FRAMING_LEMMAS = {
     "widely", "universally", "commonly", "generally", "often", "traditionally",
 }
 
+# Ordinals that turn a superlative into a RANK: "the SECOND-highest peak".
+# Not superlatives themselves — "the second day" ranks nothing a lookup can
+# check — so they are read only immediately before a superlative token (see
+# superlative_rank) and never route a claim on their own.
+_ORDINAL_WORDS = {
+    "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+}
+_ORDINAL_NUMERAL = re.compile(r'^(\d{1,2})(?:st|nd|rd|th)$', re.I)
+
+# Every ordinal as the retriever's tokenizer sees it — lowercase, 3+ characters.
+# Public because retriever.rarest_fact_token excludes them; see there.
+ORDINAL_TOKENS = frozenset({"first", *_ORDINAL_WORDS} |
+                           {f"{n}{s}" for n in range(1, 11)
+                            for s in ("st", "nd", "rd", "th")})
+
 # Upper bound on the predicate query. Wikipedia's search degrades on long
 # strings, and past this length the query stops naming a category and starts
 # paraphrasing the claim — which retrieves the claim's own subject again, the
@@ -741,6 +757,41 @@ def is_superlative(token) -> bool:
     return token.tag_ in _SUPERLATIVE_TAGS or token.lemma_.lower() in _SUPERLATIVE_LEMMAS
 
 
+def superlative_rank(token) -> tuple[int, object | None]:
+    """
+    (rank, ordinal_token) for a superlative token. (1, None) when unranked.
+
+    "K2 is the second-highest peak on Earth" ranks K2 SECOND. Read as a plain
+    superlative, the claim asked "what is the highest peak?", got Everest, and
+    compared it with K2 — a true claim that could never be supported, because
+    the question it was checked against was not the one it made.
+
+    POSITIONAL, NOT BY DEPENDENCY. Measured on en_core_web_sm, the ordinal hangs
+    off different heads depending on how it is written:
+
+        'second-highest'  second  RB  advmod -> highest
+        '2nd highest'     2nd     JJ  amod   -> mountain   (a sibling, not a child)
+
+    Both are the token immediately before the superlative, hyphen skipped. That
+    position is what the two spellings share, so it is what is tested.
+    """
+    doc = token.doc
+    i = token.i - 1
+    while i >= 0 and doc[i].is_punct:
+        i -= 1
+    if i < 0:
+        return 1, None
+
+    prev = doc[i]
+    rank = _ORDINAL_WORDS.get(prev.lower_)
+    if rank is None:
+        m = _ORDINAL_NUMERAL.match(prev.text)
+        rank = int(m.group(1)) if m else None
+    if rank is None or rank < 1:
+        return 1, None
+    return rank, prev
+
+
 def superlative_type_word(fact: str) -> str | None:
     """
     The noun a superlative claim ranks WITHIN — 'settlement', 'animal', 'zone'.
@@ -748,8 +799,8 @@ def superlative_type_word(fact: str) -> str | None:
     Returns None when the claim carries no superlative, or when no noun governs
     the one it has.
 
-    READS THE CLAIM, NOT THE QUERY. program._type_word answers the same question
-    from build_predicate_query's output, and its docstring records three separate
+    READS THE CLAIM, NOT THE QUERY. program._type_word (since removed) answered the
+    same question from build_predicate_query's output, and recorded three separate
     failures caused by doing so: that output is "a keyword fragment, not a
     sentence", so en_core_web_sm re-parses it by the rightward-compounding rule
     and roots the whole span on its last word. Each fix narrowed which last word
@@ -763,7 +814,7 @@ def superlative_type_word(fact: str) -> str | None:
     preposition and the category does not.
 
     THE LAST-NOUN RULE HOLDS ONLY WHILE THE SCOPE IS A PROPER NOUN. _type_word's
-    own comment says so: "THE SCOPE ENTITY IS ALWAYS PROPN, BY CONSTRUCTION ...
+    own comment said so: "THE SCOPE ENTITY IS ALWAYS PROPN, BY CONSTRUCTION ...
     the trailing scope ('United States', 'East Asia') is always the proper noun
     at the end". True for those examples, false in general — 'on the planet',
     'in history', 'on Earth today' all end in a COMMON noun, so the last NOUN is
@@ -924,6 +975,16 @@ def build_predicate_query(fact: str) -> str | None:
     # the broken half. The defect is that this loop discards a token the
     # detector had already accepted.
     superlative_indices = {t.i for t in superlatives}
+
+    # THE ORDINAL IS PART OF THE MARKER. "second-highest peak Earth" and
+    # "highest peak Earth" are different questions with different answers; the
+    # ordinal is RB or JJ and would otherwise be dropped (RB fails the POS
+    # whitelist), turning a rank-2 claim into a rank-1 question.
+    for sup in superlatives:
+        _, ordinal = superlative_rank(sup)
+        if ordinal is not None:
+            superlative_indices.add(ordinal.i)
+            start = min(start, ordinal.i)
 
     keep = []
     has_category_noun = False

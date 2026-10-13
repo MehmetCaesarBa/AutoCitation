@@ -218,8 +218,8 @@ def test_units_are_normalised_before_comparison():
     29,031 ft and 8,848 m are the same mountain. Comparing the raw numbers
     would make feet beat metres every time.
     """
-    feet = 29031 * prog._UNIT_TO_BASE["ft"]
-    metres = 8611 * prog._UNIT_TO_BASE["metres"]
+    feet = prog._to_base("29,031", "ft", "length")
+    metres = prog._to_base("8,611", "metres", "length")
     assert feet > metres
     assert prog._handle_compare(
         feet, metres, "Everest", "K2", "height", "29,031 ft", "8,611 m"
@@ -352,6 +352,20 @@ def test_premises_are_two_sentence_windows(monkeypatch):
      "Juan Ponce de León.", False),
     ("Mount Everest", "K2 is the highest mountain in the world.", "K2",
      "Mount Everest attracts many climbers. Climbing Mount Everest is dangerous.", False),
+    # A different record, live, accepted at p=0.74 under the old 0.5 threshold:
+    # 'second' for farthest-from-centre is not 'second-highest'.
+    ("Huascarán", "K2 is the second-highest peak on Earth.", "K2",
+     "=== Farthest point from Earth's center === The summit of Mount Everest is "
+     "higher above sea level, but the summit of Chimborazo is widely reported to "
+     "be the farthest point on the surface from Earth's center, with Huascarán in "
+     "Peru a very close second. As a result of the oblate spheroid shape of the "
+     "planet Earth, which is thicker at the Equator than it is from pole to pole, "
+     "the summit of Chimborazo is the fixed point on Earth that has the utmost "
+     "distance from the center.", False),
+    # ...while the subject's own lead sentence clears the raised threshold.
+    ("K2", "K2 is the second-highest peak on Earth.", "K2",
+     "K2, at 8,611 metres (28,251 ft) above sea level, is the second-highest "
+     "mountain on Earth, after Mount Everest at 8,849 metres (29,032 ft).", True),
 ])
 def test_kind_check_with_the_real_nli_model(answer, claim, subject, evidence, expected):
     assert prog._answer_is_right_kind(answer, "q", [evidence],
@@ -425,3 +439,12 @@ def test_than_object_recovers_a_mistagged_entity():
     """
     p = prog.synthesize("Mount Everest is taller than K2.")
     assert p is not None and p.steps[1].args[0] == "K2"
+
+
+def test_short_name_with_a_digit_is_grounded():
+    """'K2' has no word of 4+ letters, so grounding used to reject it outright."""
+    assert prog._answer_is_grounded("K2", ["K2, at 8,611 metres, is the second-highest mountain."])
+
+
+def test_short_name_must_match_as_a_whole_word():
+    assert not prog._answer_is_grounded("K2", ["K2-18b is an exoplanet."])
